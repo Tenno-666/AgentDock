@@ -88,7 +88,7 @@ fn join_text(items: &[Value]) -> String {
         .join("")
 }
 
-fn truncate(s: &str, max_chars: usize) -> (String, bool) {
+pub fn truncate(s: &str, max_chars: usize) -> (String, bool) {
     match s.char_indices().nth(max_chars) {
         Some((idx, _)) => (s[..idx].to_string(), true),
         None => (s.to_string(), false),

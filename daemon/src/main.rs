@@ -1,9 +1,21 @@
 use std::net::SocketAddr;
 
+use agentdock_daemon::acp_host::{Host, HostConfig};
 use anyhow::{Context, bail};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7820";
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term.recv() => {},
+    }
+    tracing::info!("shutdown signal received");
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -20,10 +32,15 @@ async fn main() -> anyhow::Result<()> {
         bail!("refusing to listen on non-loopback address {addr} (phase 1 is local only)");
     }
 
+    let host = Host::new(HostConfig::default());
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!("agentdock-daemon listening on ws://{addr}/ws");
-    axum::serve(listener, agentdock_daemon::api::router()).await?;
+    axum::serve(listener, agentdock_daemon::api::router(host.clone()))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    host.shutdown_all().await;
+    tracing::info!("all agent processes closed");
     Ok(())
 }

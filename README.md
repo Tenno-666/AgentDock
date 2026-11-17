@@ -40,7 +40,7 @@ app（Flutter：Linux / Android / Windows）
 |---|---|---|
 | S0 | ACP 前期验证（审批、历史加载、会话锁、接管交还） | 完成，见 [docs/S0-实测记录.md](docs/S0-实测记录.md) |
 | S1 | daemon 骨架：会话发现、只读查看、WebSocket 接口 | 完成 |
-| S2 | 接管与对话 | 未开始 |
+| S2 | 接管与对话（S2 期间工具调用一律自动拒绝） | 完成 |
 | S3 | 远程审批 | 未开始 |
 | S4 | 待办收集 | 未开始 |
 | S5 | Flutter Linux 版 App | 未开始 |

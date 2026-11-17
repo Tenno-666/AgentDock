@@ -75,19 +75,48 @@ pub fn parse_tmux_panes(output: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Pane targets from every tmux server of the current user (`/tmp/tmux-<uid>/*`).
+/// Panes on a non-default server get a `[-L name]` suffix so the hint is actionable.
 pub fn tmux_pane_map() -> HashMap<String, String> {
-    let out = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}",
-        ])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => parse_tmux_panes(&String::from_utf8_lossy(&o.stdout)),
-        _ => HashMap::new(), // tmux not running: no pane mapping, still list sessions
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut map = HashMap::new();
+    let Ok(uid) = fs::metadata("/proc/self").map(|m| m.uid()) else {
+        return map;
+    };
+    let base = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+    let dir = PathBuf::from(base).join(format!("tmux-{uid}"));
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return map; // tmux never started
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_socket()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let out = Command::new("tmux")
+            .arg("-S")
+            .arg(entry.path())
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}",
+            ])
+            .output();
+        let Ok(o) = out else { continue };
+        if !o.status.success() {
+            continue; // stale socket, server gone
+        }
+        for (tty, target) in parse_tmux_panes(&String::from_utf8_lossy(&o.stdout)) {
+            let label = if name == "default" {
+                target
+            } else {
+                format!("{target} [-L {name}]")
+            };
+            map.insert(tty, label);
+        }
     }
+    map
 }
 
 fn is_kiro_process(proc_root: &Path, pid: u32) -> bool {
