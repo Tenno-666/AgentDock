@@ -42,7 +42,7 @@ app（Flutter：Linux / Android / Windows）
 | S1 | daemon 骨架：会话发现、只读查看、WebSocket 接口 | 完成 |
 | S2 | 接管与对话（S2 期间工具调用一律自动拒绝） | 完成 |
 | S3 | 远程审批（审批卡片显示完整参数，先回复者生效，不回复就一直等待） | 完成 |
-| S4 | 待办收集 | 未开始 |
+| S4 | 待办收集（扫描会话文件中的【待办已确认】标记，SQLite 存储，预留优先级/截止日期） | 完成 |
 | S5 | Flutter Linux 版 App | 未开始 |
 | 二期 | Claude Code 接入、Android 端、飞书登录与设备配对、内网/VPN 访问 | 未开始 |
 | 三期 | Windows 端、外网中转 | 未开始 |

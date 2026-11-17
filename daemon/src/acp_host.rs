@@ -130,7 +130,8 @@ impl Host {
         self.events.subscribe()
     }
 
-    fn emit(&self, event: Value) {
+    /// Broadcast an event to every connected client.
+    pub fn emit(&self, event: Value) {
         let _ = self.events.send(event); // no subscribers is fine
     }
 

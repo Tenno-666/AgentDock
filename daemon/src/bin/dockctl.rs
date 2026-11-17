@@ -11,6 +11,10 @@
 //!   dockctl detach <id>              release a session (resume it in a terminal later)
 //!   dockctl approvals                list pending approvals
 //!   dockctl approve <approvalId> <optionId>   answer an approval (e.g. from another terminal)
+//!   dockctl todo [open|done|all]     list todos (default open)
+//!   dockctl todo add <title> [high|medium|low] [YYYY-MM-DD]
+//!   dockctl todo done|reopen|rm <n>  update / delete todo #n
+//!   dockctl todo watch               print todo.changed events
 //!   dockctl raw '<json>'             send a raw request, print the raw reply
 //!
 //! During send/chat a permission card is shown and the answer is read from stdin:
@@ -306,7 +310,98 @@ fn print_view(r: &Value) {
 
 const USAGE: &str = "usage: dockctl sessions | view <id> [limit] | attached | attach <id> | new <cwd> \
 | send <id> <text> | chat <id> | cancel <id> | detach <id> | approvals | approve <approvalId> <optionId> \
-| raw '<json>'";
+| todo [open|done|all|add <title> [priority] [YYYY-MM-DD]|done <n>|reopen <n>|rm <n>|watch] | raw '<json>'";
+
+fn print_todo(t: &Value) {
+    let mark = if t["status"] == "done" { "x" } else { " " };
+    let mut extra = Vec::new();
+    if let Some(p) = t["priority"].as_str() {
+        extra.push(format!("优先级:{p}"));
+    }
+    if let Some(d) = t["dueDate"].as_str() {
+        extra.push(format!("截止:{d}"));
+    }
+    match t["source"].as_str() {
+        Some("auto") => extra.push(format!(
+            "来源:{} {}",
+            t["agent"].as_str().unwrap_or("?"),
+            t["sessionId"].as_str().unwrap_or("-")
+        )),
+        _ => extra.push("手动".into()),
+    }
+    println!(
+        "[{mark}] #{:<4} {}  ({})",
+        t["id"],
+        t["title"].as_str().unwrap_or(""),
+        extra.join("，")
+    );
+}
+
+async fn todo_cmd(c: &mut Conn, args: &[String]) -> anyhow::Result<()> {
+    let id = |s: Option<&String>| -> anyhow::Result<i64> {
+        s.context("missing todo id")?
+            .trim_start_matches('#')
+            .parse()
+            .context("todo id must be a number")
+    };
+    let sub = args.first().map(String::as_str).unwrap_or("open");
+    match sub {
+        "open" | "done" | "all" if args.len() <= 1 => {
+            let r = c
+                .call(json!({"type": "todo.list", "status": sub}), None)
+                .await?;
+            let list = r["todos"].as_array().cloned().unwrap_or_default();
+            for t in &list {
+                print_todo(t);
+            }
+            println!("共 {} 条（{sub}）", list.len());
+        }
+        "add" if (2..=4).contains(&args.len()) => {
+            let mut req = json!({"type": "todo.add", "title": args[1]});
+            for a in &args[2..] {
+                if a.len() == 10 && a.as_bytes()[4] == b'-' {
+                    req["dueDate"] = json!(a);
+                } else {
+                    req["priority"] = json!(a);
+                }
+            }
+            let r = c.call(req, None).await?;
+            print_todo(&r["todo"]);
+        }
+        "done" | "reopen" if args.len() == 2 => {
+            let status = if sub == "done" { "done" } else { "open" };
+            let r = c
+                .call(
+                    json!({"type": "todo.update", "todoId": id(args.get(1))?, "status": status}),
+                    None,
+                )
+                .await?;
+            print_todo(&r["todo"]);
+        }
+        "rm" if args.len() == 2 => {
+            let todo_id = id(args.get(1))?;
+            c.call(json!({"type": "todo.delete", "todoId": todo_id}), None)
+                .await?;
+            println!("已删除 #{todo_id}");
+        }
+        "watch" if args.len() == 1 => {
+            println!("监听待办变化，Ctrl-C 退出");
+            loop {
+                let m = c.recv().await?;
+                if m["type"] == "todo.changed" {
+                    print!("[{}] ", m["action"].as_str().unwrap_or("?"));
+                    if m["todo"].is_object() {
+                        print_todo(&m["todo"]);
+                    } else {
+                        println!("#{}", m["todoId"]);
+                    }
+                }
+            }
+        }
+        _ => bail!(USAGE),
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -410,6 +505,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("已回复 {} → {}", r["approvalId"], r["optionId"]);
         }
+        (Some("todo"), _) => todo_cmd(&mut c, &args[1..]).await?,
         (Some("raw"), 2) => {
             let req: Value = serde_json::from_str(&args[1]).context("raw json")?;
             let id = c.send(req).await?;
