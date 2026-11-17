@@ -43,9 +43,26 @@ app（Flutter：Linux / Android / Windows）
 | S2 | 接管与对话（S2 期间工具调用一律自动拒绝） | 完成 |
 | S3 | 远程审批（审批卡片显示完整参数，先回复者生效，不回复就一直等待） | 完成 |
 | S4 | 待办收集（扫描会话文件中的【待办已确认】标记，SQLite 存储，预留优先级/截止日期） | 完成 |
-| S5 | Flutter Linux 版 App | 未开始 |
+| S5 | Flutter Linux 版 App（会话 / 对话 / 审批 / 待办 四页，宽屏侧栏、窄屏底栏） | 完成 |
 | 二期 | Claude Code 接入、Android 端、飞书登录与设备配对、内网/VPN 访问 | 未开始 |
 | 三期 | Windows 端、外网中转 | 未开始 |
+
+## 运行
+
+```bash
+# 1. daemon（只监听 127.0.0.1:7820）
+cd daemon && cargo build --release && ./target/release/agentdock-daemon
+
+# 2. App（Linux 桌面）
+cd app && flutter build linux --release
+./build/linux/x64/release/bundle/agentdock_app
+# 连接其他地址：flutter run -d linux --dart-define=AGENTDOCK_URL=ws://host:port/ws
+
+# 3. 命令行客户端（调试用）
+cd daemon && ./target/release/dockctl sessions
+```
+
+测试：`cd daemon && cargo test`；`cd app && flutter test`；真实端到端（需 daemon 在运行，会消耗模型调用）：`cd app && flutter test integration_test/e2e_real_test.dart -d linux`。
 
 ## 目录结构
 
