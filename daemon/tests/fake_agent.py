@@ -71,8 +71,11 @@ for line in sys.stdin:
         else:
             send({"id": mid, "result": {"stopReason": "end_turn"}})
     elif method is None and mid == "perm-1":
+        if pending is None:  # turn already cancelled; late answer is ignored
+            continue
         prompt_id, sid = pending
-        opt = m["result"]["outcome"].get("optionId")
+        outcome = m["result"]["outcome"]
+        opt = outcome.get("optionId") if outcome.get("outcome") == "selected" else "cancelled"
         update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": "t1",
                      "status": "completed" if opt == "allow_once" else "failed"})
         chunk(sid, "agent_message_chunk", "perm: %s" % opt)

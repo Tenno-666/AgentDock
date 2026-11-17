@@ -9,8 +9,13 @@
 //!   dockctl chat <id>                interactive: each stdin line is one message
 //!   dockctl cancel <id>              cancel the running turn
 //!   dockctl detach <id>              release a session (resume it in a terminal later)
+//!   dockctl approvals                list pending approvals
+//!   dockctl approve <approvalId> <optionId>   answer an approval (e.g. from another terminal)
 //!   dockctl raw '<json>'             send a raw request, print the raw reply
 //!
+//! During send/chat a permission card is shown and the answer is read from stdin:
+//!   y = allow_once, a = allow_always, n = reject_once, empty line = keep waiting
+//!   (answer elsewhere with `dockctl approve`).
 //! Options (env): AGENTDOCK_URL (default ws://127.0.0.1:7820/ws), DOCKCTL_THOUGHTS=1
 
 use std::io::Write;
@@ -18,14 +23,25 @@ use std::io::Write;
 use anyhow::{Context, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+
+type Input = Lines<BufReader<Stdin>>;
 
 struct Conn {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
     show_thoughts: bool,
+}
+
+fn option_for_key(key: &str) -> Option<&'static str> {
+    match key.trim() {
+        "y" | "Y" => Some("allow_once"),
+        "a" | "A" => Some("allow_always"),
+        "n" | "N" => Some("reject_once"),
+        _ => None,
+    }
 }
 
 impl Conn {
@@ -76,8 +92,50 @@ impl Conn {
         }
     }
 
+    /// Ask on stdin; returns once answered here, or when someone else answered.
+    async fn handle_approval(&mut self, req: &Value, input: &mut Input) -> anyhow::Result<()> {
+        let approval_id = req["approvalId"].as_str().unwrap_or_default().to_string();
+        loop {
+            print!("  选择 [y]允许一次 [a]总是允许 [n]拒绝，回车=暂不处理 > ");
+            let _ = std::io::stdout().flush();
+            let line = input.next_line().await?.unwrap_or_default();
+            let Some(option) = option_for_key(&line) else {
+                println!(
+                    "  （保持等待，可在其他终端执行：dockctl approve {approval_id} <optionId>）"
+                );
+                return Ok(());
+            };
+            let r = self
+                .send(json!({"type": "permission.reply", "approvalId": approval_id, "optionId": option}))
+                .await?;
+            loop {
+                let m = self.recv().await?;
+                if m["id"] == json!(r) {
+                    if m["type"] == "error" {
+                        println!(
+                            "  回复失败：[{}] {}",
+                            m["code"].as_str().unwrap_or("?"),
+                            m["message"]
+                        );
+                        if m["code"] == "APPROVAL_NOT_FOUND" {
+                            return Ok(());
+                        }
+                        break; // ask again
+                    }
+                    return Ok(());
+                }
+                self.print_event(&m);
+            }
+        }
+    }
+
     /// Send one prompt and stream events until prompt.done for this session.
-    async fn send_prompt(&mut self, session: &str, text: &str) -> anyhow::Result<()> {
+    async fn send_prompt(
+        &mut self,
+        session: &str,
+        text: &str,
+        input: &mut Input,
+    ) -> anyhow::Result<()> {
         self.call(
             json!({"type": "prompt.send", "sessionId": session, "text": text}),
             Some(session),
@@ -89,8 +147,10 @@ impl Conn {
                 continue;
             }
             self.print_event(&m);
-            if m["type"] == "prompt.done" || m["type"] == "session.closed" {
-                return Ok(());
+            match m["type"].as_str() {
+                Some("permission.request") => self.handle_approval(&m, input).await?,
+                Some("prompt.done" | "session.closed") => return Ok(()),
+                _ => {}
             }
         }
     }
@@ -126,9 +186,14 @@ impl Conn {
                     String::new()
                 }
             ),
-            "permission.autoRejected" => println!(
-                "\n  [审批] 已自动拒绝（S2 不支持远程审批）：{}",
-                m["title"].as_str().unwrap_or("")
+            "permission.request" => print_card(m),
+            "permission.resolved" => println!(
+                "  [审批结果] {} → {}（{}）",
+                m["approvalId"].as_str().unwrap_or("-"),
+                m["optionId"]
+                    .as_str()
+                    .unwrap_or(m["outcome"].as_str().unwrap_or("-")),
+                m["reason"].as_str().unwrap_or("-")
             ),
             "prompt.done" => match m["error"].as_str() {
                 Some(e) => println!("\n[结束] 出错：{e}"),
@@ -138,6 +203,35 @@ impl Conn {
             _ => {}
         }
     }
+}
+
+fn print_card(m: &Value) {
+    println!(
+        "\n  ┌─ 审批请求 {} ─ 会话 {}",
+        m["approvalId"].as_str().unwrap_or("-"),
+        m["sessionId"].as_str().unwrap_or("-")
+    );
+    println!(
+        "  │ 工具：{} ({})",
+        m["toolName"].as_str().unwrap_or("?"),
+        m["kind"].as_str().unwrap_or("?")
+    );
+    println!("  │ 标题：{}", m["title"].as_str().unwrap_or("-"));
+    if m["inputUnknown"] == true {
+        println!("  │ ⚠ 未能获取完整参数，请谨慎批准");
+    } else {
+        let pretty = serde_json::to_string_pretty(&m["rawInput"]).unwrap_or_default();
+        for line in pretty.lines() {
+            println!("  │ {line}");
+        }
+    }
+    let opts: Vec<&str> = m["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| o["optionId"].as_str())
+        .collect();
+    println!("  └─ 可选：{}", opts.join(" / "));
 }
 
 fn short(s: Option<&str>, n: usize) -> String {
@@ -211,12 +305,14 @@ fn print_view(r: &Value) {
 }
 
 const USAGE: &str = "usage: dockctl sessions | view <id> [limit] | attached | attach <id> | new <cwd> \
-| send <id> <text> | chat <id> | cancel <id> | detach <id> | raw '<json>'";
+| send <id> <text> | chat <id> | cancel <id> | detach <id> | approvals | approve <approvalId> <optionId> \
+| raw '<json>'";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |i: usize| args.get(i).map(String::as_str);
+    let mut input: Input = BufReader::new(tokio::io::stdin()).lines();
     let mut c = Conn::connect().await?;
     match (arg(0), args.len()) {
         (Some("sessions"), 1) => {
@@ -269,16 +365,15 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("[新会话] {}", r["sessionId"].as_str().unwrap_or("-"));
         }
-        (Some("send"), 3) => c.send_prompt(&args[1], &args[2]).await?,
+        (Some("send"), 3) => c.send_prompt(&args[1], &args[2], &mut input).await?,
         (Some("chat"), 2) => {
             println!(
                 "已连接 {}，每行一条消息，Ctrl-D 退出（会话保持接管状态）",
                 args[1]
             );
-            let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-            while let Some(line) = lines.next_line().await? {
+            while let Some(line) = input.next_line().await? {
                 if !line.trim().is_empty() {
-                    c.send_prompt(&args[1], &line).await?;
+                    c.send_prompt(&args[1], &line, &mut input).await?;
                 }
             }
         }
@@ -297,6 +392,23 @@ async fn main() -> anyhow::Result<()> {
                 "已断开 {}，可在终端执行：kiro-cli --resume-id {}",
                 args[1], args[1]
             );
+        }
+        (Some("approvals"), 1) => {
+            let r = c.call(json!({"type": "permission.list"}), None).await?;
+            let list = r["approvals"].as_array().cloned().unwrap_or_default();
+            for a in &list {
+                print_card(a);
+            }
+            println!("共 {} 个待审批", list.len());
+        }
+        (Some("approve"), 3) => {
+            let r = c
+                .call(
+                    json!({"type": "permission.reply", "approvalId": args[1], "optionId": args[2]}),
+                    None,
+                )
+                .await?;
+            println!("已回复 {} → {}", r["approvalId"], r["optionId"]);
         }
         (Some("raw"), 2) => {
             let req: Value = serde_json::from_str(&args[1]).context("raw json")?;

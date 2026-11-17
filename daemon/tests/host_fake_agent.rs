@@ -45,6 +45,7 @@ fn setup(name: &str, max_sessions: usize) -> Env {
         prompt_timeout: Duration::from_secs(10),
         sessions_dir: dir.clone(),
         allowed_root: dir.clone(),
+        audit_path: Some(dir.join("audit.jsonl")),
     });
     let events = host.subscribe();
     Env { host, events, dir }
@@ -110,23 +111,85 @@ async fn attach_replays_history_then_prompt_streams() {
 }
 
 #[tokio::test]
-async fn permission_requests_are_auto_rejected() {
-    let mut env = setup("perm", 4);
+async fn permission_allow_flow_with_audit() {
+    let mut env = setup("perm-allow", 4);
     env.host.attach(OK_ID).await.unwrap();
     env.host.prompt(OK_ID, "use a tool").await.unwrap();
-    let evs = collect_until(&mut env.events, |e| e["type"] == "prompt.done").await;
+    let evs = collect_until(&mut env.events, |e| e["type"] == "permission.request").await;
+    let req = evs.last().unwrap().clone();
+    // parameters come from the preceding tool_call update, matched by toolCallId
+    assert_eq!(req["rawInput"]["command"], "echo hello");
+    assert_eq!(req["inputUnknown"], false);
+    assert_eq!(req["options"].as_array().unwrap().len(), 3);
+    assert_eq!(env.host.pending_approvals().len(), 1);
 
-    let rejected: Vec<_> = evs
+    let id = req["approvalId"].as_str().unwrap();
+    assert_eq!(
+        env.host
+            .reply_permission(id, "bogus")
+            .await
+            .unwrap_err()
+            .code,
+        "BAD_REQUEST"
+    );
+    env.host.reply_permission(id, "allow_once").await.unwrap();
+    // first reply wins
+    assert_eq!(
+        env.host
+            .reply_permission(id, "reject_once")
+            .await
+            .unwrap_err()
+            .code,
+        "APPROVAL_NOT_FOUND"
+    );
+    let evs = collect_until(&mut env.events, |e| e["type"] == "prompt.done").await;
+    let resolved = evs
         .iter()
-        .filter(|e| e["type"] == "permission.autoRejected")
-        .collect();
-    assert_eq!(rejected.len(), 1);
-    assert_eq!(rejected[0]["outcome"]["optionId"], "reject_once");
-    let start = evs
-        .iter()
-        .find(|e| e["type"] == "tool.call" && e["phase"] == "start")
+        .find(|e| e["type"] == "permission.resolved")
         .unwrap();
-    assert_eq!(start["rawInput"]["command"], "echo hello");
+    assert_eq!(
+        (resolved["optionId"].as_str(), resolved["reason"].as_str()),
+        (Some("allow_once"), Some("user"))
+    );
+    let end = evs
+        .iter()
+        .find(|e| e["type"] == "tool.call" && e["phase"] == "update")
+        .unwrap();
+    assert_eq!(end["status"], "completed");
+    assert!(
+        texts(&evs, "assistant")
+            .iter()
+            .any(|(t, _)| t == "perm: allow_once")
+    );
+    assert!(env.host.pending_approvals().is_empty());
+
+    let audit = std::fs::read_to_string(env.dir.join("audit.jsonl")).unwrap();
+    let lines: Vec<Value> = audit
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{audit}");
+    assert_eq!(lines[0]["event"], "requested");
+    assert_eq!(lines[0]["rawInput"]["command"], "echo hello");
+    assert_eq!(
+        (lines[1]["event"].as_str(), lines[1]["optionId"].as_str()),
+        (Some("resolved"), Some("allow_once"))
+    );
+    env.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn permission_reject_flow() {
+    let mut env = setup("perm-reject", 4);
+    env.host.attach(OK_ID).await.unwrap();
+    env.host.prompt(OK_ID, "use a tool").await.unwrap();
+    let evs = collect_until(&mut env.events, |e| e["type"] == "permission.request").await;
+    let id = evs.last().unwrap()["approvalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.host.reply_permission(&id, "reject_once").await.unwrap();
+    let evs = collect_until(&mut env.events, |e| e["type"] == "prompt.done").await;
     let end = evs
         .iter()
         .find(|e| e["type"] == "tool.call" && e["phase"] == "update")
@@ -138,6 +201,44 @@ async fn permission_requests_are_auto_rejected() {
             .any(|(t, _)| t == "perm: reject_once")
     );
     env.host.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn unanswered_permission_waits_and_cancel_or_detach_voids_it() {
+    let mut env = setup("perm-wait", 4);
+    env.host.attach(OK_ID).await.unwrap();
+    env.host.prompt(OK_ID, "use a tool").await.unwrap();
+    collect_until(&mut env.events, |e| e["type"] == "permission.request").await;
+
+    // nothing is approved automatically: still pending after a while
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(env.host.pending_approvals().len(), 1);
+    assert_eq!(env.host.attached_list()[0]["promptRunning"], true);
+
+    env.host.cancel(OK_ID).await.unwrap();
+    let evs = collect_until(&mut env.events, |e| e["type"] == "prompt.done").await;
+    let resolved = evs
+        .iter()
+        .find(|e| e["type"] == "permission.resolved")
+        .unwrap();
+    assert_eq!(
+        (resolved["outcome"].as_str(), resolved["reason"].as_str()),
+        (Some("cancelled"), Some("prompt_cancelled"))
+    );
+    assert_eq!(evs.last().unwrap()["stopReason"], "cancelled");
+    assert!(env.host.pending_approvals().is_empty());
+
+    // a pending card is voided when the session is detached
+    env.host.prompt(OK_ID, "use a tool again").await.unwrap();
+    collect_until(&mut env.events, |e| e["type"] == "permission.request").await;
+    env.host.detach(OK_ID).await.unwrap();
+    let evs = collect_until(&mut env.events, |e| e["type"] == "session.closed").await;
+    let resolved = evs
+        .iter()
+        .find(|e| e["type"] == "permission.resolved")
+        .unwrap();
+    assert_eq!(resolved["reason"], "detached");
+    assert!(env.host.pending_approvals().is_empty());
 }
 
 #[tokio::test]

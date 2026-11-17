@@ -1,13 +1,16 @@
 //! Attached-session manager: owns up to N `kiro-cli acp` processes and broadcasts
 //! their events to every connected client.
 //!
-//! S2 policy: every permission request is auto-rejected (remote approval is S3).
+//! Permission requests are forwarded to clients as `permission.request`; the first
+//! `permission.reply` wins. Nothing is approved automatically: an unanswered request
+//! keeps the agent waiting. Every request and resolution is appended to an audit log.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -48,10 +51,13 @@ pub struct HostConfig {
     pub sessions_dir: PathBuf,
     /// `session.new` only accepts working directories under this root.
     pub allowed_root: PathBuf,
+    /// Append-only JSONL audit log of permission requests; None disables it.
+    pub audit_path: Option<PathBuf>,
 }
 
 impl Default for HostConfig {
     fn default() -> Self {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         Self {
             program: "kiro-cli".into(),
             args: vec!["acp".into()],
@@ -61,7 +67,8 @@ impl Default for HostConfig {
             load_timeout: Duration::from_secs(60),
             prompt_timeout: Duration::from_secs(30 * 60),
             sessions_dir: discovery::kiro_sessions_dir(),
-            allowed_root: PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
+            audit_path: Some(home.join(".local/share/agentdock/audit.jsonl")),
+            allowed_root: home,
         }
     }
 }
@@ -73,14 +80,36 @@ struct Attached {
     prompt_running: AtomicBool,
     replaying: AtomicBool,
     closing: AtomicBool,
+    /// toolCallId -> {title, kind, toolName, rawInput} from `tool_call` updates; the
+    /// permission request itself only carries the title (S0 T1).
+    tool_calls: Mutex<HashMap<String, Value>>,
+}
+
+struct PendingApproval {
+    session_id: String,
+    rpc_id: Value,
+    client: Arc<AcpClient>,
+    option_ids: Vec<String>,
+    /// The `permission.request` event as sent to clients.
+    event: Value,
 }
 
 pub struct Host {
     config: HostConfig,
     sessions: Mutex<HashMap<String, Arc<Attached>>>,
+    approvals: Mutex<HashMap<String, PendingApproval>>,
+    next_approval: AtomicU64,
     /// Serializes attach/new so the session limit cannot be raced.
     op_lock: tokio::sync::Mutex<()>,
+    audit_lock: Mutex<()>,
     events: broadcast::Sender<Value>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Host {
@@ -89,7 +118,10 @@ impl Host {
         Arc::new(Self {
             config,
             sessions: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
+            next_approval: AtomicU64::new(1),
             op_lock: tokio::sync::Mutex::new(()),
+            audit_lock: Mutex::new(()),
             events,
         })
     }
@@ -163,6 +195,7 @@ impl Host {
             prompt_running: AtomicBool::new(false),
             replaying: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            tool_calls: Mutex::new(HashMap::new()),
         });
         tokio::spawn(pump(Arc::downgrade(self), att.clone(), rx));
         let init = att
@@ -404,6 +437,18 @@ impl Host {
             .notify("session/cancel", json!({"sessionId": session_id}))
             .await
             .map_err(|e| map_acp_error(e, "session/cancel"))?;
+        // ACP: after session/cancel the client answers pending permission requests
+        // with the `cancelled` outcome.
+        for pa in self.take_approvals(session_id) {
+            let _ = pa
+                .client
+                .respond(
+                    pa.rpc_id.clone(),
+                    json!({"outcome": {"outcome": "cancelled"}}),
+                )
+                .await;
+            self.resolved(&pa, None, "cancelled", "prompt_cancelled");
+        }
         Ok(json!({"sessionId": session_id, "cancelRequested": true}))
     }
 
@@ -415,6 +460,7 @@ impl Host {
             .remove(session_id)
             .ok_or_else(not_attached)?;
         close(&att).await;
+        self.drop_approvals(session_id, "detached");
         self.emit(json!({"type": "session.closed", "sessionId": session_id, "reason": "detached"}));
         Ok(json!({"sessionId": session_id, "detached": true}))
     }
@@ -423,9 +469,192 @@ impl Host {
         let all: Vec<_> = self.sessions.lock().unwrap().drain().collect();
         for (id, att) in all {
             close(&att).await;
+            self.drop_approvals(&id, "shutdown");
             tracing::info!(session_id = %id, "closed on shutdown");
         }
     }
+
+    // ---------------------------------------------------------------- approvals
+
+    /// Pending approvals, oldest first (for clients that connect later).
+    pub fn pending_approvals(&self) -> Vec<Value> {
+        let mut list: Vec<Value> = self
+            .approvals
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| p.event.clone())
+            .collect();
+        list.sort_by_key(|e| e["createdAtMs"].as_u64());
+        list
+    }
+
+    fn register_approval(&self, att: &Attached, rpc_id: Value, params: &Value) {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .or_else(|| att.session_id.get().map(String::as_str))
+            .unwrap_or_default()
+            .to_string();
+        let tool_call_id = params
+            .pointer("/toolCall/toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let known = att
+            .tool_calls
+            .lock()
+            .unwrap()
+            .get(tool_call_id)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let raw_input = params
+            .pointer("/toolCall/rawInput")
+            .filter(|v| !v.is_null())
+            .or_else(|| known.get("rawInput").filter(|v| !v.is_null()))
+            .cloned();
+        let options = params
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let option_ids = options
+            .iter()
+            .filter_map(|o| {
+                o.get("optionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        let approval_id = format!("ap-{}", self.next_approval.fetch_add(1, Ordering::Relaxed));
+        let event = json!({
+            "type": "permission.request",
+            "approvalId": approval_id,
+            "sessionId": session_id,
+            "toolCallId": tool_call_id,
+            "title": params.pointer("/toolCall/title").or_else(|| known.get("title")),
+            "kind": known.get("kind"),
+            "toolName": known.get("toolName"),
+            "rawInput": raw_input,
+            // The card must warn when parameters could not be matched.
+            "inputUnknown": raw_input.is_none(),
+            "options": options,
+            "trustOptions": params.pointer("/_meta/trustOptions"),
+            "createdAtMs": now_ms(),
+        });
+        self.audit(json!({
+            "event": "requested",
+            "approvalId": approval_id,
+            "sessionId": session_id,
+            "title": event["title"],
+            "toolName": event["toolName"],
+            "rawInput": event["rawInput"],
+        }));
+        self.approvals.lock().unwrap().insert(
+            approval_id,
+            PendingApproval {
+                session_id,
+                rpc_id,
+                client: att.client.clone(),
+                option_ids,
+                event: event.clone(),
+            },
+        );
+        self.emit(event);
+    }
+
+    /// Answer a pending approval. The first reply wins; later ones get APPROVAL_NOT_FOUND.
+    pub async fn reply_permission(
+        &self,
+        approval_id: &str,
+        option_id: &str,
+    ) -> Result<Value, HostError> {
+        let pa = {
+            let mut map = self.approvals.lock().unwrap();
+            let Some(pa) = map.get(approval_id) else {
+                return Err(HostError::new(
+                    "APPROVAL_NOT_FOUND",
+                    "审批不存在或已被处理（可能已在其他设备上处理）",
+                ));
+            };
+            if !pa.option_ids.iter().any(|o| o == option_id) {
+                return Err(HostError::new(
+                    "BAD_REQUEST",
+                    format!("optionId must be one of {:?}", pa.option_ids),
+                ));
+            }
+            map.remove(approval_id).expect("checked above")
+        };
+        let answer = json!({"outcome": {"outcome": "selected", "optionId": option_id}});
+        if let Err(e) = pa.client.respond(pa.rpc_id.clone(), answer).await {
+            self.resolved(&pa, Some(option_id), "failed", "agent_unreachable");
+            return Err(map_acp_error(e, "permission reply"));
+        }
+        self.resolved(&pa, Some(option_id), "selected", "user");
+        Ok(json!({"approvalId": approval_id, "optionId": option_id, "sessionId": pa.session_id}))
+    }
+
+    fn take_approvals(&self, session_id: &str) -> Vec<PendingApproval> {
+        let mut map = self.approvals.lock().unwrap();
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, p)| p.session_id == session_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        ids.into_iter().filter_map(|k| map.remove(&k)).collect()
+    }
+
+    /// The agent is gone: nothing to answer, just tell clients the cards are void.
+    fn drop_approvals(&self, session_id: &str, reason: &str) {
+        for pa in self.take_approvals(session_id) {
+            self.resolved(&pa, None, "cancelled", reason);
+        }
+    }
+
+    fn resolved(&self, pa: &PendingApproval, option_id: Option<&str>, outcome: &str, reason: &str) {
+        let approval_id = &pa.event["approvalId"];
+        self.audit(json!({
+            "event": "resolved",
+            "approvalId": approval_id,
+            "sessionId": pa.session_id,
+            "title": pa.event["title"],
+            "optionId": option_id,
+            "outcome": outcome,
+            "reason": reason,
+        }));
+        self.emit(json!({
+            "type": "permission.resolved",
+            "approvalId": approval_id,
+            "sessionId": pa.session_id,
+            "optionId": option_id,
+            "outcome": outcome,
+            "reason": reason,
+        }));
+    }
+
+    fn audit(&self, mut record: Value) {
+        let Some(path) = &self.config.audit_path else {
+            return;
+        };
+        record["tsMs"] = json!(now_ms());
+        let _guard = self.audit_lock.lock().unwrap();
+        if let Err(e) = append_private(path, &record) {
+            tracing::error!("audit log write failed ({}): {e}", path.display());
+        }
+    }
+}
+
+/// Append one JSON line; the file is created with mode 0600 (it contains commands).
+fn append_private(path: &Path, record: &Value) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    writeln!(f, "{record}")
 }
 
 fn not_attached() -> HostError {
@@ -464,26 +693,6 @@ fn read_meta_cwd(sessions_dir: &Path, session_id: &str) -> Option<String> {
     v.get("cwd").and_then(Value::as_str).map(str::to_string)
 }
 
-/// Pick the reject option for a permission request (S2 policy).
-pub fn auto_reject_outcome(params: &Value) -> Value {
-    let option = params
-        .get("options")
-        .and_then(Value::as_array)
-        .and_then(|opts| {
-            opts.iter()
-                .find(|o| o["kind"] == "reject_once")
-                .or_else(|| {
-                    opts.iter()
-                        .find(|o| o["kind"].as_str().is_some_and(|k| k.starts_with("reject")))
-                })
-        })
-        .and_then(|o| o.get("optionId").and_then(Value::as_str));
-    match option {
-        Some(id) => json!({"outcome": {"outcome": "selected", "optionId": id}}),
-        None => json!({"outcome": {"outcome": "cancelled"}}),
-    }
-}
-
 fn content_text(content: &Value) -> String {
     // ContentBlock {type:"text", text} or ToolCallContent [{type:"content", content:{...}}]
     if let Some(t) = content.get("text").and_then(Value::as_str) {
@@ -499,6 +708,37 @@ fn content_text(content: &Value) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/// Remember tool-call parameters so permission cards can show them.
+fn track_tool_call(att: &Attached, params: &Value) {
+    let Some(u) = params.get("update") else {
+        return;
+    };
+    let kind = u.get("sessionUpdate").and_then(Value::as_str);
+    if !matches!(kind, Some("tool_call" | "tool_call_update")) {
+        return;
+    }
+    let Some(id) = u.get("toolCallId").and_then(Value::as_str) else {
+        return;
+    };
+    let mut map = att.tool_calls.lock().unwrap();
+    if matches!(
+        u.get("status").and_then(Value::as_str),
+        Some("completed" | "failed")
+    ) {
+        map.remove(id);
+        return;
+    }
+    let entry = map.entry(id.to_string()).or_insert_with(|| json!({}));
+    for key in ["title", "kind", "rawInput"] {
+        if let Some(v) = u.get(key).filter(|v| !v.is_null()) {
+            entry[key] = v.clone();
+        }
+    }
+    if let Some(name) = u.pointer("/_meta/kiro/toolName") {
+        entry["toolName"] = name.clone();
+    }
 }
 
 /// Translate an ACP `session/update` into a client event.
@@ -553,23 +793,17 @@ async fn pump(host: Weak<Host>, att: Arc<Attached>, mut rx: mpsc::UnboundedRecei
         };
         match incoming {
             Incoming::Notification { method, params } if method == "session/update" => {
-                host.emit(update_event(&params, att.replaying.load(Ordering::SeqCst)));
+                let replay = att.replaying.load(Ordering::SeqCst);
+                if !replay {
+                    track_tool_call(&att, &params);
+                }
+                host.emit(update_event(&params, replay));
             }
             Incoming::Notification { method, .. } => {
                 tracing::debug!(%method, "ignored agent notification");
             }
             Incoming::Request { id, method, params } if method == "session/request_permission" => {
-                let outcome = auto_reject_outcome(&params);
-                if let Err(e) = att.client.respond(id, outcome.clone()).await {
-                    tracing::warn!("failed to answer permission request: {e}");
-                }
-                host.emit(json!({
-                    "type": "permission.autoRejected",
-                    "sessionId": params.get("sessionId"),
-                    "toolCallId": params.pointer("/toolCall/toolCallId"),
-                    "title": params.pointer("/toolCall/title"),
-                    "outcome": outcome["outcome"],
-                }));
+                host.register_approval(&att, id, &params);
             }
             Incoming::Request { id, method, .. } => {
                 let _ = att
@@ -593,6 +827,7 @@ async fn pump(host: Weak<Host>, att: Arc<Attached>, mut rx: mpsc::UnboundedRecei
         }
     };
     if removed && !att.closing.load(Ordering::SeqCst) {
+        host.drop_approvals(sid, "agent_exited");
         host.emit(json!({"type": "session.closed", "sessionId": sid, "reason": "agent_exited"}));
     }
 }
@@ -600,33 +835,6 @@ async fn pump(host: Weak<Host>, att: Arc<Attached>, mut rx: mpsc::UnboundedRecei
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn auto_reject_picks_reject_once() {
-        // options exactly as kiro-cli 2.13.0 sent them in S0 T1
-        let p = json!({"options":[
-            {"optionId":"allow_once","kind":"allow_once"},
-            {"optionId":"allow_always","kind":"allow_always"},
-            {"optionId":"reject_once","kind":"reject_once"}]});
-        assert_eq!(
-            auto_reject_outcome(&p)["outcome"]["optionId"],
-            "reject_once"
-        );
-        let only_always = json!({"options":[{"optionId":"r","kind":"reject_always"}]});
-        assert_eq!(
-            auto_reject_outcome(&only_always)["outcome"]["optionId"],
-            "r"
-        );
-        let none = json!({"options":[{"optionId":"a","kind":"allow_once"}]});
-        assert_eq!(
-            auto_reject_outcome(&none)["outcome"]["outcome"],
-            "cancelled"
-        );
-        assert_eq!(
-            auto_reject_outcome(&json!({}))["outcome"]["outcome"],
-            "cancelled"
-        );
-    }
 
     #[test]
     fn busy_detection_uses_data_field() {
@@ -675,5 +883,19 @@ mod tests {
             false,
         );
         assert_eq!(other["type"], "session.update");
+    }
+
+    #[test]
+    fn audit_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let p =
+            std::env::temp_dir().join(format!("agentdock-audit-{}/a.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        append_private(&p, &json!({"a": 1})).unwrap();
+        append_private(&p, &json!({"a": 2})).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&p).unwrap().lines().count(), 2);
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 }

@@ -9,11 +9,13 @@
 //!   {"id": 6, "type": "prompt.send", "sessionId": "...", "text": "..."}
 //!   {"id": 7, "type": "prompt.cancel", "sessionId": "..."}
 //!   {"id": 8, "type": "session.detach", "sessionId": "..."}
+//!   {"id": 9, "type": "permission.list"}
+//!   {"id": 10, "type": "permission.reply", "approvalId": "ap-1", "optionId": "allow_once"}
 //! Replies: {"id": <same>, "type": "<request type>.result", ...}
 //!          {"id": <same>, "type": "error", "code": "...", "message": "..."}
 //! Events (no id) are pushed to every connection: message.chunk, tool.call,
-//! permission.autoRejected, prompt.started, prompt.done, session.attached,
-//! session.closed, session.update, events.lagged.
+//! permission.request, permission.resolved, prompt.started, prompt.done,
+//! session.attached, session.closed, session.update, events.lagged.
 
 use std::sync::Arc;
 
@@ -55,6 +57,13 @@ enum Request {
     PromptCancel { session_id: String },
     #[serde(rename = "session.detach", rename_all = "camelCase")]
     SessionDetach { session_id: String },
+    #[serde(rename = "permission.list")]
+    PermissionList,
+    #[serde(rename = "permission.reply", rename_all = "camelCase")]
+    PermissionReply {
+        approval_id: String,
+        option_id: String,
+    },
 }
 
 impl Request {
@@ -68,6 +77,8 @@ impl Request {
             Request::PromptSend { .. } => "prompt.send.result",
             Request::PromptCancel { .. } => "prompt.cancel.result",
             Request::SessionDetach { .. } => "session.detach.result",
+            Request::PermissionList => "permission.list.result",
+            Request::PermissionReply { .. } => "permission.reply.result",
         }
     }
 }
@@ -189,6 +200,11 @@ async fn handle_request(host: &Arc<Host>, req: Request) -> Result<Value, HostErr
         Request::PromptSend { session_id, text } => host.prompt(&session_id, &text).await,
         Request::PromptCancel { session_id } => host.cancel(&session_id).await,
         Request::SessionDetach { session_id } => host.detach(&session_id).await,
+        Request::PermissionList => Ok(json!({"approvals": host.pending_approvals()})),
+        Request::PermissionReply {
+            approval_id,
+            option_id,
+        } => host.reply_permission(&approval_id, &option_id).await,
     }
 }
 
@@ -203,7 +219,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_bad_input_with_id_echo() {
-        let host = Host::new(HostConfig::default());
+        let host = Host::new(HostConfig {
+            audit_path: None,
+            ..HostConfig::default()
+        });
         let r = handle_text(&host, "{bad").await;
         assert_eq!(
             (r["type"].as_str(), r["code"].as_str()),
@@ -234,5 +253,14 @@ mod tests {
         let r = handle_text(&host, r#"{"id":2,"type":"attached.list"}"#).await;
         assert_eq!(r["type"], "attached.list.result");
         assert_eq!(r["sessions"], json!([]));
+
+        let r = handle_text(&host, r#"{"id":3,"type":"permission.list"}"#).await;
+        assert_eq!(r["approvals"], json!([]));
+        let r = handle_text(
+            &host,
+            r#"{"id":4,"type":"permission.reply","approvalId":"ap-1","optionId":"allow_once"}"#,
+        )
+        .await;
+        assert_eq!(r["code"], "APPROVAL_NOT_FOUND");
     }
 }
