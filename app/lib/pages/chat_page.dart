@@ -102,25 +102,48 @@ class _ChatViewState extends State<_ChatView> {
   }
 
   Future<void> _detach() async {
+    final origin = widget.chat.originPane;
+    var handback = origin != null;
+    final small = Theme.of(context).textTheme.bodySmall;
+    final messenger = ScaffoldMessenger.of(context);
     final ok = await showDialog<bool>(
       context: context,
-      builder: (c) => AlertDialog(
-        title: const Text('断开会话？'),
-        content: SelectableText(
-          '断开后可在终端续接：\nkiro-cli --resume-id ${widget.chat.sessionId}\n\n'
-          '如果终端提示 "Failed to resume session"，说明续接超时并已静默新开会话，请 /quit 后重试。',
+      builder: (c) => StatefulBuilder(
+        builder: (c, set) => AlertDialog(
+          title: const Text('断开会话？'),
+          content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            if (origin != null)
+              CheckboxListTile(
+                key: const ValueKey('handback'),
+                contentPadding: EdgeInsets.zero,
+                value: handback,
+                onChanged: (v) => set(() => handback = v ?? false),
+                title: Text('交还到原终端窗格 $origin'),
+                subtitle: const Text('在该窗格中自动执行 kiro-cli --resume-id 续接'),
+              ),
+            SelectableText(
+              '手动续接：kiro-cli --resume-id ${widget.chat.sessionId}\n'
+              '如果终端提示 "Failed to resume session"，说明续接超时并已静默新开会话，请 /quit 后重试。',
+              style: small,
+            ),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('取消')),
+            FilledButton(key: const ValueKey('confirm-detach'), onPressed: () => Navigator.pop(c, true), child: const Text('断开')),
+          ],
         ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('断开')),
-        ],
       ),
     );
     if (ok != true) return;
     try {
-      await widget.state.detach(widget.chat.sessionId);
+      final r = await widget.state.detach(widget.chat.sessionId, handback: handback);
+      if (r?['handedBack'] == true) {
+        messenger.showSnackBar(SnackBar(content: Text('已交还到终端 ${r?['pane']}')));
+      } else if (r?['handbackError'] != null) {
+        messenger.showSnackBar(SnackBar(content: Text('已断开，但未交还：${r?['handbackError']}')));
+      }
     } on DaemonError catch (e) {
-      _snack(e.message);
+      messenger.showSnackBar(SnackBar(content: Text(e.message)));
     }
   }
 

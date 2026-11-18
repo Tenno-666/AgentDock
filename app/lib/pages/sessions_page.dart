@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../app_state.dart';
 import '../daemon_client.dart';
+import 'folder_picker_page.dart';
 
 class SessionsPage extends StatelessWidget {
   const SessionsPage({super.key, required this.state});
@@ -18,24 +19,33 @@ class SessionsPage extends StatelessWidget {
   }
 
   Future<void> _newSession(BuildContext context) async {
-    final ctl = TextEditingController(text: '/home/mi/Project/AgentDock/spike/workdir');
-    final cwd = await showDialog<String>(
+    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => FolderPickerPage(state: state)));
+  }
+
+  /// Sessions open in a tmux pane are quit there first, after confirmation.
+  Future<void> _attach(BuildContext context, Json s) async {
+    final sid = '${s['sessionId']}';
+    final pane = s['tmuxPane'] as String?;
+    if (pane == null) {
+      await _run(context, () => state.attach(sid));
+      return;
+    }
+    final ok = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
-        title: const Text('新建会话'),
-        content: TextField(
-          controller: ctl,
-          decoration: const InputDecoration(labelText: '工作目录（HOME 下的绝对路径）'),
-          autofocus: true,
+        title: const Text('从终端接管？'),
+        content: Text(
+          '将在终端 $pane 中清空输入框并执行 /quit 退出该会话，然后由 AgentDock 接管。\n\n'
+          '如果终端里正在回复或等待审批，会拒绝接管，不会打断。断开时可以交还到这个终端窗格。',
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(c), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(c, ctl.text.trim()), child: const Text('创建')),
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('取消')),
+          FilledButton(key: const ValueKey('confirm-takeover'), onPressed: () => Navigator.pop(c, true), child: const Text('接管')),
         ],
       ),
     );
-    if (cwd != null && cwd.isNotEmpty && context.mounted) {
-      await _run(context, () => state.newSession(cwd));
+    if (ok == true && context.mounted) {
+      await _run(context, () => state.attach(sid, takeover: true));
     }
   }
 
@@ -45,11 +55,19 @@ class SessionsPage extends StatelessWidget {
       appBar: AppBar(
         title: const Text('会话'),
         actions: [
-          IconButton(tooltip: '刷新', icon: const Icon(Icons.refresh), onPressed: () => _run(context, state.refreshSessions)),
+          IconButton(
+            tooltip: '刷新',
+            icon: const Icon(Icons.refresh),
+            onPressed: () => _run(context, () async {
+              await state.refreshSessions();
+              await state.refreshRecent();
+            }),
+          ),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
         key: const ValueKey('new-session'),
+        heroTag: null, // several pages stay mounted in an IndexedStack
         onPressed: () => _newSession(context),
         icon: const Icon(Icons.add),
         label: const Text('新建会话'),
@@ -77,6 +95,8 @@ class SessionsPage extends StatelessWidget {
                     state.navIndex.value = 1;
                   },
                 ),
+              _header(context, '最近会话（未运行，${state.recentSessions.length}）'),
+              for (final s in state.recentSessions) _recentTile(context, s),
             ],
           );
         },
@@ -115,9 +135,31 @@ class SessionsPage extends StatelessWidget {
         else
           FilledButton(
             key: ValueKey('attach-$sid'),
-            onPressed: () => _run(context, () => state.attach(sid)),
+            onPressed: () => _attach(context, s),
             child: const Text('接管'),
           ),
+      ]),
+    );
+  }
+
+  Widget _recentTile(BuildContext context, Json s) {
+    final sid = '${s['sessionId']}';
+    final updated = '${s['updatedAt'] ?? ''}';
+    return ListTile(
+      key: ValueKey('recent-$sid'),
+      leading: const Icon(Icons.history),
+      title: Text('${s['title'] ?? '（无标题）'}', maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: Text('${s['cwd'] ?? '-'} · ${updated.length >= 16 ? updated.substring(0, 16).replaceFirst('T', ' ') : updated} · ${sid.substring(0, 8)}'),
+      trailing: Wrap(spacing: 4, children: [
+        TextButton(
+          onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => HistoryPage(state: state, sessionId: sid, title: '${s['title'] ?? sid}'))),
+          child: const Text('查看'),
+        ),
+        OutlinedButton(
+          key: ValueKey('resume-$sid'),
+          onPressed: () => _run(context, () => state.attach(sid)),
+          child: const Text('继续'),
+        ),
       ]),
     );
   }

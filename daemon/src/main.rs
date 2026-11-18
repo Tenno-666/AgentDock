@@ -81,6 +81,17 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("open {}: {}", db_path.display(), e.message))?,
     );
     let host = Host::new(HostConfig::default());
+    let program = host.program().to_string();
+    if program.starts_with('/') {
+        tracing::info!("kiro-cli: {program}");
+    } else {
+        tracing::warn!("kiro-cli not found in PATH or ~/.local/bin; set AGENTDOCK_KIRO_CLI");
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let fs = Arc::new(
+        agentdock_daemon::fs_browse::FsBrowser::new(&home)
+            .map_err(|e| anyhow::anyhow!("home: {}", e.message))?,
+    );
     let scanner = tokio::spawn(scan_loop(host.clone(), todos.clone()));
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -93,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         host: host.clone(),
         todos,
+        fs,
     };
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())

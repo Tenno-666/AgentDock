@@ -3,12 +3,14 @@
 //!   dockctl sessions                 list active sessions on this machine
 //!   dockctl view <id> [limit]        show session history from the session file
 //!   dockctl attached                 list sessions attached by the daemon
-//!   dockctl attach <id>              take over a session (prints replayed history)
+//!   dockctl attach <id> [--takeover] take over a session; --takeover quits it in its tmux pane first
+//!   dockctl recent                   recently used sessions that are not running
+//!   dockctl fs ls [path] | fs mkdir <parent> <name> | fs mv <path> <newName> [--force]
 //!   dockctl new <cwd>                start a new session in <cwd>
 //!   dockctl send <id> <text>         send one message, stream the reply until done
 //!   dockctl chat <id>                interactive: each stdin line is one message
 //!   dockctl cancel <id>              cancel the running turn
-//!   dockctl detach <id>              release a session (resume it in a terminal later)
+//!   dockctl detach <id> [--handback] release a session; --handback resumes it in the original pane
 //!   dockctl approvals                list pending approvals
 //!   dockctl approve <approvalId> <optionId>   answer an approval (e.g. from another terminal)
 //!   dockctl todo [open|done|all]     list todos (default open)
@@ -309,7 +311,7 @@ fn print_view(r: &Value) {
 }
 
 const USAGE: &str = "usage: dockctl sessions | view <id> [limit] | attached | attach <id> | new <cwd> \
-| send <id> <text> | chat <id> | cancel <id> | detach <id> | approvals | approve <approvalId> <optionId> \
+| recent | fs ls|mkdir|mv ... | send <id> <text> | chat <id> | cancel <id> | detach <id> | approvals | approve <approvalId> <optionId> \
 | todo [open|done|all|add <title> [priority] [YYYY-MM-DD]|done <n>|reopen <n>|rm <n>|watch] | raw '<json>'";
 
 fn print_todo(t: &Value) {
@@ -442,13 +444,17 @@ async fn main() -> anyhow::Result<()> {
                 r["sessions"].as_array().map_or(0, Vec::len)
             );
         }
-        (Some("attach"), 2) => {
+        (Some("attach"), 2 | 3) => {
+            let takeover = arg(2) == Some("--takeover");
             let r = c
                 .call(
-                    json!({"type": "session.attach", "sessionId": args[1]}),
+                    json!({"type": "session.attach", "sessionId": args[1], "takeover": takeover}),
                     Some(&args[1]),
                 )
                 .await?;
+            if let Some(p) = r["tookOverFrom"].as_str() {
+                println!("\n[已从终端 {p} 退出并接管]");
+            }
             println!(
                 "\n[接管成功] {} alreadyAttached={} attempts={}",
                 args[1], r["alreadyAttached"], r["attempts"]
@@ -477,16 +483,71 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("已请求取消");
         }
-        (Some("detach"), 2) => {
-            c.call(
-                json!({"type": "session.detach", "sessionId": args[1]}),
-                None,
-            )
-            .await?;
-            println!(
-                "已断开 {}，可在终端执行：kiro-cli --resume-id {}",
-                args[1], args[1]
-            );
+        (Some("detach"), 2 | 3) => {
+            let handback = arg(2) == Some("--handback");
+            let r = c
+                .call(
+                    json!({"type": "session.detach", "sessionId": args[1], "handback": handback}),
+                    None,
+                )
+                .await?;
+            if r["handedBack"] == true {
+                println!("已断开并交还到终端 {}", r["pane"].as_str().unwrap_or("?"));
+            } else {
+                if let Some(e) = r["handbackError"].as_str() {
+                    println!("未交还：{e}");
+                }
+                println!(
+                    "已断开 {}，可在终端执行：kiro-cli --resume-id {}",
+                    args[1], args[1]
+                );
+            }
+        }
+        (Some("recent"), 1) => {
+            let r = c
+                .call(json!({"type": "sessions.recent", "limit": 20}), None)
+                .await?;
+            for s in r["sessions"].as_array().into_iter().flatten() {
+                println!(
+                    "{}  {:<22} {}  {}",
+                    s["sessionId"].as_str().unwrap_or("-"),
+                    short(s["updatedAt"].as_str(), 19),
+                    s["cwd"].as_str().unwrap_or("-"),
+                    short(s["title"].as_str(), 30)
+                );
+            }
+        }
+        (Some("fs"), 2..=5) => {
+            let req = match (arg(1), args.len()) {
+                (Some("ls"), 2 | 3) => json!({"type": "fs.list", "path": arg(2)}),
+                (Some("mkdir"), 4) => {
+                    json!({"type": "fs.mkdir", "parent": args[2], "name": args[3]})
+                }
+                (Some("mv"), 4 | 5) => {
+                    json!({"type": "fs.rename", "path": args[2], "newName": args[3],
+                    "force": arg(4) == Some("--force")})
+                }
+                _ => bail!(
+                    "usage: dockctl fs ls [path] | mkdir <parent> <name> | mv <path> <newName> [--force]"
+                ),
+            };
+            let r = c.call(req, None).await?;
+            if let Some(l) = r.get("listing") {
+                println!(
+                    "{}（此处会话 {}）",
+                    l["path"].as_str().unwrap_or("-"),
+                    l["sessionsHere"]
+                );
+                for e in l["entries"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {:<40} 会话 {}",
+                        e["name"].as_str().unwrap_or("-"),
+                        e["sessionCount"]
+                    );
+                }
+            } else {
+                println!("{}", r["entry"]["path"].as_str().unwrap_or("-"));
+            }
         }
         (Some("approvals"), 1) => {
             let r = c.call(json!({"type": "permission.list"}), None).await?;

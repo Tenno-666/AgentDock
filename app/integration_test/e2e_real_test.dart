@@ -35,10 +35,8 @@ void main() {
     await waitFor(t, () => state.conn == ConnState.connected, seconds: 10, what: 'connect');
     await t.pumpAndSettle();
 
-    // new session through the dialog (default cwd is spike/workdir)
-    await t.tap(find.byKey(const ValueKey('new-session')));
-    await t.pumpAndSettle();
-    await t.tap(find.text('创建'));
+    // new session in spike/workdir (folder picker UI is covered by e2e_takeover_test)
+    await state.newSession(workdir);
     await waitFor(t, () => state.currentChat.value != null, seconds: 90, what: 'session.new');
     final sid = state.currentChat.value!;
     await t.pumpAndSettle();

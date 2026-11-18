@@ -15,12 +15,20 @@
 //!   {"id": 12, "type": "todo.add", "title": "...", "priority": "high", "dueDate": "2026-12-01"}
 //!   {"id": 13, "type": "todo.update", "todoId": 1, "status": "done", "priority": null}
 //!   {"id": 14, "type": "todo.delete", "todoId": 1}
+//!   session.attach takes "takeover": true to quit the session in its tmux pane first;
+//!   session.detach takes "handback": true to resume it in that pane afterwards.
+//!   {"id": 15, "type": "sessions.recent", "limit": 30}
+//!   {"id": 16, "type": "fs.list", "path": "/home/mi/Code", "showHidden": false}
+//!   {"id": 17, "type": "fs.mkdir", "parent": "/home/mi/Code", "name": "new"}
+//!   {"id": 18, "type": "fs.rename", "path": "/home/mi/Code/new", "newName": "x", "force": false}
 //! Replies: {"id": <same>, "type": "<request type>.result", ...}
 //!          {"id": <same>, "type": "error", "code": "...", "message": "..."}
 //! Events (no id) are pushed to every connection: message.chunk, tool.call,
 //! permission.request, permission.resolved, prompt.started, prompt.done,
 //! session.attached, session.closed, session.update, todo.changed, events.lagged.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
@@ -34,6 +42,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::acp_host::{Host, HostError};
+use crate::fs_browse::{FsBrowser, FsError, SessionCwds};
 use crate::todo::{StoreError, TodoPatch, TodoStore};
 use crate::{discovery, session_log};
 
@@ -44,6 +53,7 @@ pub const MAX_VIEW_LIMIT: usize = 5000;
 pub struct AppState {
     pub host: Arc<Host>,
     pub todos: Arc<TodoStore>,
+    pub fs: Arc<FsBrowser>,
 }
 
 /// Absent -> None, null -> Some(None), value -> Some(Some(v)).
@@ -64,7 +74,28 @@ enum Request {
     #[serde(rename = "attached.list")]
     AttachedList,
     #[serde(rename = "session.attach", rename_all = "camelCase")]
-    SessionAttach { session_id: String },
+    SessionAttach {
+        session_id: String,
+        #[serde(default)]
+        takeover: bool,
+    },
+    #[serde(rename = "sessions.recent")]
+    SessionsRecent { limit: Option<usize> },
+    #[serde(rename = "fs.list", rename_all = "camelCase")]
+    FsList {
+        path: Option<String>,
+        #[serde(default)]
+        show_hidden: bool,
+    },
+    #[serde(rename = "fs.mkdir")]
+    FsMkdir { parent: String, name: String },
+    #[serde(rename = "fs.rename", rename_all = "camelCase")]
+    FsRename {
+        path: String,
+        new_name: String,
+        #[serde(default)]
+        force: bool,
+    },
     #[serde(rename = "session.new")]
     SessionNew { cwd: String },
     #[serde(rename = "prompt.send", rename_all = "camelCase")]
@@ -72,7 +103,11 @@ enum Request {
     #[serde(rename = "prompt.cancel", rename_all = "camelCase")]
     PromptCancel { session_id: String },
     #[serde(rename = "session.detach", rename_all = "camelCase")]
-    SessionDetach { session_id: String },
+    SessionDetach {
+        session_id: String,
+        #[serde(default)]
+        handback: bool,
+    },
     #[serde(rename = "permission.list")]
     PermissionList,
     #[serde(rename = "permission.reply", rename_all = "camelCase")]
@@ -109,6 +144,10 @@ impl Request {
             Request::SessionView { .. } => "session.view.result",
             Request::AttachedList => "attached.list.result",
             Request::SessionAttach { .. } => "session.attach.result",
+            Request::SessionsRecent { .. } => "sessions.recent.result",
+            Request::FsList { .. } => "fs.list.result",
+            Request::FsMkdir { .. } => "fs.mkdir.result",
+            Request::FsRename { .. } => "fs.rename.result",
             Request::SessionNew { .. } => "session.new.result",
             Request::PromptSend { .. } => "prompt.send.result",
             Request::PromptCancel { .. } => "prompt.cancel.result",
@@ -206,6 +245,38 @@ fn internal(e: impl std::fmt::Display) -> HostError {
     HostError::new("INTERNAL", e.to_string())
 }
 
+fn fs_err(e: FsError) -> HostError {
+    HostError::new(e.code, e.message)
+}
+
+fn canon(p: &str) -> PathBuf {
+    Path::new(p)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(p))
+}
+
+/// Session working directories for folder counts and rename protection.
+async fn session_cwds(host: &Arc<Host>) -> Result<SessionCwds, HostError> {
+    let attached = host.attached_cwds();
+    tokio::task::spawn_blocking(move || {
+        let all = discovery::list_all_meta(&discovery::kiro_sessions_dir())
+            .into_iter()
+            .filter_map(|s| s.cwd)
+            .map(|c| canon(&c))
+            .collect();
+        let live = discovery::list_active()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| s.cwd)
+            .chain(attached)
+            .map(|c| canon(&c))
+            .collect();
+        SessionCwds { all, live }
+    })
+    .await
+    .map_err(internal)
+}
+
 fn store_err(e: StoreError) -> HostError {
     HostError::new(e.code, e.message)
 }
@@ -252,11 +323,72 @@ async fn handle_request(state: &AppState, req: Request) -> Result<Value, HostErr
             Ok(json!({"sessionId": session_id, "view": view}))
         }
         Request::AttachedList => Ok(json!({"sessions": host.attached_list()})),
-        Request::SessionAttach { session_id } => host.attach(&session_id).await,
+        Request::SessionAttach {
+            session_id,
+            takeover,
+        } => host.attach_opts(&session_id, takeover).await,
+        Request::SessionsRecent { limit } => {
+            let limit = limit.unwrap_or(30).min(200);
+            let attached: HashSet<String> = host
+                .attached_list()
+                .iter()
+                .filter_map(|s| s["sessionId"].as_str().map(str::to_string))
+                .collect();
+            let list = tokio::task::spawn_blocking(move || {
+                let dir = discovery::kiro_sessions_dir();
+                let active: HashSet<String> = discovery::list_active()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.session_id)
+                    .collect();
+                discovery::list_all_meta(&dir)
+                    .into_iter()
+                    .filter(|s| {
+                        !active.contains(&s.session_id) && !attached.contains(&s.session_id)
+                    })
+                    .take(limit)
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(internal)?;
+            Ok(json!({"sessions": list}))
+        }
+        Request::FsList { path, show_hidden } => {
+            let (fs, cwds) = (state.fs.clone(), session_cwds(host).await?);
+            let l =
+                tokio::task::spawn_blocking(move || fs.list(path.as_deref(), show_hidden, &cwds))
+                    .await
+                    .map_err(internal)?
+                    .map_err(fs_err)?;
+            Ok(json!({"listing": l}))
+        }
+        Request::FsMkdir { parent, name } => {
+            let (fs, cwds) = (state.fs.clone(), session_cwds(host).await?);
+            let e = tokio::task::spawn_blocking(move || fs.mkdir(&parent, &name, &cwds))
+                .await
+                .map_err(internal)?
+                .map_err(fs_err)?;
+            Ok(json!({"entry": e}))
+        }
+        Request::FsRename {
+            path,
+            new_name,
+            force,
+        } => {
+            let (fs, cwds) = (state.fs.clone(), session_cwds(host).await?);
+            let e = tokio::task::spawn_blocking(move || fs.rename(&path, &new_name, force, &cwds))
+                .await
+                .map_err(internal)?
+                .map_err(fs_err)?;
+            Ok(json!({"entry": e}))
+        }
         Request::SessionNew { cwd } => host.new_session(&cwd).await,
         Request::PromptSend { session_id, text } => host.prompt(&session_id, &text).await,
         Request::PromptCancel { session_id } => host.cancel(&session_id).await,
-        Request::SessionDetach { session_id } => host.detach(&session_id).await,
+        Request::SessionDetach {
+            session_id,
+            handback,
+        } => host.detach_opts(&session_id, handback).await,
         Request::PermissionList => Ok(json!({"approvals": host.pending_approvals()})),
         Request::PermissionReply {
             approval_id,
@@ -320,6 +452,7 @@ mod tests {
                 ..HostConfig::default()
             }),
             todos: Arc::new(TodoStore::open_in_memory().unwrap()),
+            fs: Arc::new(FsBrowser::new(&std::env::temp_dir()).unwrap()),
         }
     }
 

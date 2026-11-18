@@ -102,6 +102,7 @@ class TodosPage extends StatelessWidget {
       ),
       floatingActionButton: FloatingActionButton(
         key: const ValueKey('todo-add'),
+        heroTag: null, // several pages stay mounted in an IndexedStack
         tooltip: '新增待办',
         onPressed: () => _add(context),
         child: const Icon(Icons.add),

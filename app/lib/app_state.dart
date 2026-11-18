@@ -27,6 +27,8 @@ class ChatSession {
   ChatSession(this.sessionId, this.cwd);
   final String sessionId;
   final String cwd;
+  /// tmux pane label the session was taken over from (hand-back target).
+  String? originPane;
   final items = <ChatItem>[];
   final _tools = <String, ChatItem>{};
   bool promptRunning = false;
@@ -76,6 +78,7 @@ class AppState extends ChangeNotifier {
   final _subs = <StreamSubscription<dynamic>>[];
 
   List<Json> activeSessions = [];
+  List<Json> recentSessions = [];
   final chats = <String, ChatSession>{}; // attached sessions, insertion order
   final approvals = <String, Json>{}; // approvalId -> permission.request
   List<Json> todos = [];
@@ -102,7 +105,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> refreshAll() async {
     try {
-      await Future.wait([refreshSessions(), _refreshAttached(), _refreshApprovals(), refreshTodos()]);
+      await Future.wait([refreshSessions(), _refreshAttached(), _refreshApprovals(), refreshTodos(), refreshRecent()]);
     } on DaemonError {
       // shown via lastError; next reconnect retries
     }
@@ -111,6 +114,12 @@ class AppState extends ChangeNotifier {
   Future<void> refreshSessions() async {
     final r = await _guard(() => client.request('sessions.list'));
     activeSessions = List<Json>.from(r?['sessions'] ?? const []);
+    notifyListeners();
+  }
+
+  Future<void> refreshRecent() async {
+    final r = await _guard(() => client.request('sessions.recent', {'limit': 30}));
+    recentSessions = List<Json>.from(r?['sessions'] ?? const []);
     notifyListeners();
   }
 
@@ -149,18 +158,24 @@ class AppState extends ChangeNotifier {
   ChatSession _chatFor(String sid, [String cwd = '']) =>
       chats.putIfAbsent(sid, () => ChatSession(sid, cwd));
 
-  Future<void> attach(String sessionId) async {
+  /// [takeover]: quit the session in its tmux pane first (daemon refuses if busy).
+  Future<void> attach(String sessionId, {bool takeover = false}) async {
     // replay events arrive before the result; create the chat first
     final c = _chatFor(sessionId);
     c.items.clear();
     c._tools.clear();
     c.closed = false;
+    final Json? r;
     try {
-      await _guard(() => client.request('session.attach', {'sessionId': sessionId}));
+      // takeover waits up to 15s for the terminal to quit, then loads (<=2x60s)
+      r = await _guard(() => client.request('session.attach', {'sessionId': sessionId, 'takeover': takeover},
+          const Duration(seconds: 160)));
     } on DaemonError {
       if (c.items.isEmpty) chats.remove(sessionId);
+      notifyListeners();
       rethrow;
     }
+    c.originPane = r?['tookOverFrom'] as String?;
     _openChat(sessionId);
   }
 
@@ -171,14 +186,17 @@ class AppState extends ChangeNotifier {
     _openChat(sid);
   }
 
-  Future<void> detach(String sessionId) async {
-    await _guard(() => client.request('session.detach', {'sessionId': sessionId}));
+  /// Returns the daemon reply (handedBack / pane / handbackError).
+  Future<Json?> detach(String sessionId, {bool handback = false}) async {
+    final r = await _guard(() => client.request('session.detach', {'sessionId': sessionId, 'handback': handback}));
     chats.remove(sessionId);
     if (currentChat.value == sessionId) {
       currentChat.value = chats.keys.isEmpty ? null : chats.keys.first;
     }
     notifyListeners();
     unawaited(refreshSessions());
+    unawaited(refreshRecent().catchError((_) {}));
+    return r;
   }
 
   void _openChat(String sid) {
@@ -199,6 +217,19 @@ class AppState extends ChangeNotifier {
 
   Future<void> cancelPrompt(String sessionId) =>
       _guard(() => client.request('prompt.cancel', {'sessionId': sessionId}));
+
+  // ------------------------------------------------------------ folders (on the computer)
+
+  Future<Json?> fsList(String? path, {bool showHidden = false}) async {
+    final r = await _guard(() => client.request('fs.list', {'path': ?path, 'showHidden': showHidden}));
+    return r?['listing'] as Json?;
+  }
+
+  Future<void> fsMkdir(String parent, String name) =>
+      _guard(() => client.request('fs.mkdir', {'parent': parent, 'name': name}));
+
+  Future<void> fsRename(String path, String newName, {bool force = false}) =>
+      _guard(() => client.request('fs.rename', {'path': path, 'newName': newName, 'force': force}));
 
   // ------------------------------------------------------------ approvals
 

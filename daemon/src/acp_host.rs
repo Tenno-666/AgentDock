@@ -55,11 +55,44 @@ pub struct HostConfig {
     pub audit_path: Option<PathBuf>,
 }
 
+/// Locate kiro-cli: $AGENTDOCK_KIRO_CLI, then $PATH, then ~/.local/bin (its install
+/// location). Needed because services started by systemd/desktop do not get the
+/// interactive shell PATH.
+pub fn resolve_kiro_cli(
+    env_override: Option<&str>,
+    path_var: Option<&str>,
+    home: &Path,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |p: &Path| {
+        p.is_file() && std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    };
+    if let Some(p) = env_override.filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(p);
+        return executable(&p).then_some(p);
+    }
+    let from_path = path_var
+        .into_iter()
+        .flat_map(|v| v.split(':'))
+        .filter(|d| !d.is_empty());
+    from_path
+        .map(|d| Path::new(d).join("kiro-cli"))
+        .chain(std::iter::once(home.join(".local/bin/kiro-cli")))
+        .find(|p| executable(p))
+}
+
 impl Default for HostConfig {
     fn default() -> Self {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let program = resolve_kiro_cli(
+            std::env::var("AGENTDOCK_KIRO_CLI").ok().as_deref(),
+            std::env::var("PATH").ok().as_deref(),
+            &home,
+        )
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "kiro-cli".into());
         Self {
-            program: "kiro-cli".into(),
+            program,
             args: vec!["acp".into()],
             max_sessions: 4,
             init_timeout: Duration::from_secs(30),
@@ -83,6 +116,8 @@ struct Attached {
     /// toolCallId -> {title, kind, toolName, rawInput} from `tool_call` updates; the
     /// permission request itself only carries the title (S0 T1).
     tool_calls: Mutex<HashMap<String, Value>>,
+    /// tmux pane the session was taken over from (for hand-back on detach).
+    origin_pane: Mutex<Option<discovery::PaneRef>>,
 }
 
 struct PendingApproval {
@@ -128,6 +163,11 @@ impl Host {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
+    }
+
+    /// The agent executable that will be spawned.
+    pub fn program(&self) -> &str {
+        &self.config.program
     }
 
     /// Broadcast an event to every connected client.
@@ -187,8 +227,16 @@ impl Host {
 
     async fn spawn_attached(self: &Arc<Self>, cwd: &str) -> Result<Arc<Attached>, HostError> {
         let (client, rx) =
-            AcpClient::spawn(&self.config.program, &self.config.args, Path::new(cwd))
-                .map_err(|e| HostError::new("SPAWN_FAILED", e.to_string()))?;
+            AcpClient::spawn(&self.config.program, &self.config.args, Path::new(cwd)).map_err(
+                |e| {
+                    let hint = if e.to_string().contains("No such file") {
+                        "（找不到 kiro-cli：请设置环境变量 AGENTDOCK_KIRO_CLI=<kiro-cli 绝对路径> 后重启 daemon）"
+                    } else {
+                        ""
+                    };
+                    HostError::new("SPAWN_FAILED", format!("{e}{hint}"))
+                },
+            )?;
         let att = Arc::new(Attached {
             session_id: OnceLock::new(),
             cwd: cwd.to_string(),
@@ -197,6 +245,7 @@ impl Host {
             replaying: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             tool_calls: Mutex::new(HashMap::new()),
+            origin_pane: Mutex::new(None),
         });
         tokio::spawn(pump(Arc::downgrade(self), att.clone(), rx));
         let init = att
@@ -222,6 +271,16 @@ impl Host {
 
     /// Take over an existing session (it must not be open in another process).
     pub async fn attach(self: &Arc<Self>, session_id: &str) -> Result<Value, HostError> {
+        self.attach_opts(session_id, false).await
+    }
+
+    /// `takeover`: if the session is open in a tmux pane, quit it there first
+    /// (Ctrl+U, `/quit`), then load it. Refused while the terminal is mid-turn.
+    pub async fn attach_opts(
+        self: &Arc<Self>,
+        session_id: &str,
+        takeover: bool,
+    ) -> Result<Value, HostError> {
         if !discovery::is_valid_session_id(session_id) {
             return Err(HostError::new("BAD_REQUEST", "invalid sessionId"));
         }
@@ -237,26 +296,124 @@ impl Host {
             )
         })?;
 
+        let origin =
+            if takeover && discovery::is_session_locked(&self.config.sessions_dir, session_id) {
+                Some(self.quit_in_terminal(session_id).await?)
+            } else {
+                None
+            };
+
         let mut last_err = None;
         for attempt in 1..=2 {
             match self.try_load(session_id, &cwd).await {
                 Ok(att) => {
+                    *att.origin_pane.lock().unwrap() = origin.clone();
                     self.insert(session_id, att);
                     return Ok(json!({
                         "sessionId": session_id,
                         "cwd": cwd,
                         "alreadyAttached": false,
                         "attempts": attempt,
+                        "tookOverFrom": origin.as_ref().map(|p| p.label.clone()),
                     }));
                 }
                 Err(e) if e.code == "LOAD_TIMEOUT" => {
                     tracing::warn!(session_id, attempt, "session/load timed out");
                     last_err = Some(e);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
             }
         }
-        Err(last_err.expect("loop ran"))
+        let mut err = last_err.expect("loop ran");
+        // We already quit it in the terminal: give it back rather than lose it.
+        if let Some(pane) = &origin {
+            match resume_in_pane(pane, session_id, &cwd).await {
+                Ok(()) => err
+                    .message
+                    .push_str(&format!("；已在 {} 恢复终端会话", pane.label)),
+                Err(e) => err.message.push_str(&format!(
+                    "；恢复终端会话失败（{e}），请手动执行 kiro-cli --resume-id {session_id}"
+                )),
+            }
+        }
+        Err(err)
+    }
+
+    async fn quit_in_terminal(&self, session_id: &str) -> Result<discovery::PaneRef, HostError> {
+        let dir = self.config.sessions_dir.clone();
+        let sid = session_id.to_string();
+        let found = tokio::task::spawn_blocking(move || {
+            let pane = discovery::pane_of_session(&dir, &sid);
+            let state = discovery::turn_state(&dir.join(format!("{sid}.jsonl")));
+            let cmd = pane.as_ref().and_then(|(_, p)| p.current_command());
+            (pane, state, cmd)
+        })
+        .await
+        .map_err(|e| HostError::new("INTERNAL", e.to_string()))?;
+        let (Some((_, pane)), state, cmd) = found else {
+            return Err(HostError::new(
+                "SESSION_BUSY",
+                "会话正在其他进程中打开（不在 tmux 中，可能是 IDE），无法自动退出，请手动关闭后再接管",
+            ));
+        };
+        if cmd.as_deref() != Some("kiro-cli") {
+            return Err(HostError::new(
+                "TAKEOVER_FAILED",
+                format!(
+                    "窗格 {} 的前台程序是 {:?}，不是 kiro-cli，未发送任何按键",
+                    pane.label, cmd
+                ),
+            ));
+        }
+        if state == discovery::TurnState::Busy {
+            return Err(HostError::new(
+                "TERMINAL_BUSY",
+                format!(
+                    "会话在终端 {} 中正在回复或等待审批，为避免打断，未自动退出。请在终端完成后再接管",
+                    pane.label
+                ),
+            ));
+        }
+        let p = pane.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            p.send_key("C-u")?; // clear any unsent draft
+            std::thread::sleep(Duration::from_millis(200));
+            p.send_text("/quit")?;
+            p.send_key("Enter")
+        })
+        .await
+        .map_err(|e| HostError::new("INTERNAL", e.to_string()))?
+        .map_err(|e| HostError::new("TAKEOVER_FAILED", format!("发送按键失败：{e}")))?;
+        tracing::info!(session_id, pane = %pane.label, "sent /quit for takeover");
+        if !self
+            .wait_unlocked(session_id, Duration::from_secs(15))
+            .await
+        {
+            return Err(HostError::new(
+                "TAKEOVER_FAILED",
+                format!(
+                    "已在 {} 发送 /quit，但 15 秒内会话没有退出，请查看终端",
+                    pane.label
+                ),
+            ));
+        }
+        Ok(pane)
+    }
+
+    async fn wait_unlocked(&self, session_id: &str, max: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + max;
+        loop {
+            if !discovery::is_session_locked(&self.config.sessions_dir, session_id) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
     }
 
     async fn try_load(
@@ -454,6 +611,11 @@ impl Host {
     }
 
     pub async fn detach(&self, session_id: &str) -> Result<Value, HostError> {
+        self.detach_opts(session_id, false).await
+    }
+
+    /// `handback`: after closing, resume the session in the pane it was taken from.
+    pub async fn detach_opts(&self, session_id: &str, handback: bool) -> Result<Value, HostError> {
         let att = self
             .sessions
             .lock()
@@ -463,7 +625,40 @@ impl Host {
         close(&att).await;
         self.drop_approvals(session_id, "detached");
         self.emit(json!({"type": "session.closed", "sessionId": session_id, "reason": "detached"}));
-        Ok(json!({"sessionId": session_id, "detached": true}))
+        let origin = att.origin_pane.lock().unwrap().clone();
+        let mut out = json!({"sessionId": session_id, "detached": true, "handedBack": false});
+        if !handback {
+            return Ok(out);
+        }
+        let Some(pane) = origin else {
+            out["handbackError"] = json!("该会话不是从终端接管的，没有原窗格");
+            return Ok(out);
+        };
+        if !self
+            .wait_unlocked(session_id, Duration::from_secs(10))
+            .await
+        {
+            out["handbackError"] = json!("会话锁未释放，未交还");
+            return Ok(out);
+        }
+        match resume_in_pane(&pane, session_id, &att.cwd).await {
+            Ok(()) => {
+                out["handedBack"] = json!(true);
+                out["pane"] = json!(pane.label);
+            }
+            Err(e) => out["handbackError"] = json!(e),
+        }
+        Ok(out)
+    }
+
+    /// Working directories of attached sessions (rename protection).
+    pub fn attached_cwds(&self) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|a| a.cwd.clone())
+            .collect()
     }
 
     pub async fn shutdown_all(&self) {
@@ -660,6 +855,43 @@ fn append_private(path: &Path, record: &Value) -> std::io::Result<()> {
 
 fn not_attached() -> HostError {
     HostError::new("NOT_ATTACHED", "session is not attached")
+}
+
+const SHELLS: [&str; 5] = ["bash", "zsh", "sh", "fish", "dash"];
+
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Type `cd <cwd> && kiro-cli --resume-id <id>` into the pane, only if it sits at a shell.
+async fn resume_in_pane(
+    pane: &discovery::PaneRef,
+    session_id: &str,
+    cwd: &str,
+) -> Result<(), String> {
+    let pane = pane.clone();
+    let cmd = format!(
+        "cd {} && kiro-cli --resume-id {session_id}",
+        shell_quote(cwd)
+    );
+    tokio::task::spawn_blocking(move || {
+        let fg = pane.current_command();
+        match fg.as_deref() {
+            Some(c) if SHELLS.contains(&c) => {}
+            other => {
+                return Err(format!(
+                    "原窗格 {} 当前不在 shell（{other:?}），未交还",
+                    pane.label
+                ));
+            }
+        }
+        pane.send_key("C-u")
+            .and_then(|_| pane.send_text(&cmd))
+            .and_then(|_| pane.send_key("Enter"))
+            .map_err(|e| format!("发送按键失败：{e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 async fn close(att: &Attached) {
@@ -884,6 +1116,64 @@ mod tests {
             false,
         );
         assert_eq!(other["type"], "session.update");
+    }
+
+    #[test]
+    fn kiro_cli_resolution_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("agentdock-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let local = home.join(".local/bin");
+        let other = base.join("bin");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let mk = |p: &Path, mode: u32| {
+            std::fs::write(p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mk(&local.join("kiro-cli"), 0o755);
+        // systemd-like PATH without ~/.local/bin falls back to the install dir
+        assert_eq!(
+            resolve_kiro_cli(None, Some("/usr/bin:/bin"), &home),
+            Some(local.join("kiro-cli"))
+        );
+        assert_eq!(
+            resolve_kiro_cli(None, None, &home),
+            Some(local.join("kiro-cli"))
+        );
+        // PATH wins over the fallback; non-executable entries are skipped
+        mk(&other.join("kiro-cli"), 0o644);
+        let path = other.to_str().unwrap().to_string();
+        assert_eq!(
+            resolve_kiro_cli(None, Some(&path), &home),
+            Some(local.join("kiro-cli"))
+        );
+        mk(&other.join("kiro-cli"), 0o755);
+        assert_eq!(
+            resolve_kiro_cli(None, Some(&path), &home),
+            Some(other.join("kiro-cli"))
+        );
+        // explicit override, and an invalid override is not silently replaced
+        let o = other.join("kiro-cli").to_string_lossy().to_string();
+        assert_eq!(
+            resolve_kiro_cli(Some(&o), None, &home),
+            Some(other.join("kiro-cli"))
+        );
+        assert_eq!(
+            resolve_kiro_cli(Some("/nope/kiro-cli"), Some(&path), &home),
+            None
+        );
+        std::fs::remove_file(local.join("kiro-cli")).unwrap();
+        assert_eq!(resolve_kiro_cli(None, Some("/usr/bin"), &home), None);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn shell_quoting() {
+        assert_eq!(shell_quote("/home/mi/a b"), "'/home/mi/a b'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("$(rm -rf ~)"), "'$(rm -rf ~)'");
     }
 
     #[test]
