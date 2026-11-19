@@ -77,6 +77,7 @@ void main() {
 
     // folder picker: navigate to spike/workdir, mkdir, rename, create a session there
     final stamp = DateTime.now().millisecondsSinceEpoch;
+    ScaffoldMessenger.of(t.element(find.byType(Scaffold).first)).clearSnackBars();
     state.navIndex.value = 0;
     await t.pumpAndSettle();
     await tapAndSettle(t, find.byKey(const ValueKey('new-session')));

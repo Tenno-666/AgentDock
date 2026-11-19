@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:agentdock_app/app_state.dart';
 import 'package:agentdock_app/daemon_client.dart';
 import 'package:agentdock_app/main.dart';
+import 'package:agentdock_app/widgets/approval_card.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:stream_channel/stream_channel.dart';
@@ -172,17 +173,20 @@ void main() {
     await tester.pumpAndSettle();
     // switched to chat tab with replayed history
     expect(state.navIndex.value, 1);
-    expect(find.text('旧问题'), findsOneWidget);
-    expect(find.text('旧回答'), findsOneWidget);
+    expect(find.textContaining('> 旧问题'), findsOneWidget);
+    expect(find.textContaining('旧回答', findRichText: true), findsWidgets);
 
     await tester.enterText(find.byKey(const ValueKey('composer')), '帮我 touch 一下\n第二行');
     await tester.tap(find.byKey(const ValueKey('send')));
     await tester.pumpAndSettle();
     final sentPrompt = daemon.ch.sent.firstWhere((m) => m['type'] == 'prompt.send');
     expect(sentPrompt['text'], '帮我 touch 一下\n第二行', reason: 'multi-line text is sent as one message');
-    expect(find.text('好的，我来执行'), findsOneWidget, reason: 'chunks are merged');
-    // approval card shows the exact command
+    expect(find.textContaining('好的，我来执行', findRichText: true), findsWidgets, reason: 'chunks are merged');
+    expect(find.text('Shell touch /tmp/x'), findsOneWidget, reason: 'tool line like Kiro CLI');
+    // the approval opens as a bottom sheet with the exact command
+    expect(find.byType(ApprovalSheet), findsOneWidget);
     expect(find.textContaining('"command": "touch /tmp/x"'), findsWidgets);
+    expect(find.text('等待审批'), findsOneWidget, reason: 'status line');
     expect(state.approvals.length, 1);
 
     await tester.tap(find.byKey(const ValueKey('opt-allow_once-ap-1')).first);
@@ -190,7 +194,9 @@ void main() {
     final reply = daemon.ch.sent.firstWhere((m) => m['type'] == 'permission.reply');
     expect((reply['approvalId'], reply['optionId']), ('ap-1', 'allow_once'));
     expect(state.approvals, isEmpty);
-    expect(find.textContaining('已处理：允许一次'), findsOneWidget);
+    expect(find.byType(ApprovalSheet), findsNothing, reason: 'sheet closes once resolved');
+    expect(find.textContaining('审批：已允许一次'), findsOneWidget);
+    expect(find.text('空闲'), findsOneWidget);
     expect(state.chats[sid]!.promptRunning, isFalse);
 
     // todo pushed by daemon appears on the todo page
@@ -226,6 +232,14 @@ void main() {
     await tester.pumpAndSettle();
     expect(daemon.ch.sent.where((m) => m['type'] == 'permission.reply'), isEmpty, reason: 'cancel sends nothing');
     expect(state.approvals.length, 1);
+
+    // closing the sheet without answering keeps it pending; tapping the line reopens it
+    Navigator.of(tester.element(find.byType(ApprovalSheet))).pop();
+    await tester.pumpAndSettle();
+    expect(find.byType(ApprovalSheet), findsNothing, reason: 'not auto-reopened after dismiss');
+    await tester.tap(find.byKey(const ValueKey('approval-line-ap-1')));
+    await tester.pumpAndSettle();
+    expect(find.byType(ApprovalSheet), findsOneWidget);
   });
 
   testWidgets('terminal session: confirm takeover, hand back on detach', (tester) async {
@@ -301,6 +315,38 @@ void main() {
     expect(daemon.ch.sent.firstWhere((m) => m['type'] == 'session.new')['cwd'], '/home/mi/新项目');
     expect(find.text('选择工作目录'), findsNothing, reason: 'picker closes after creating');
     expect(state.navIndex.value, 1);
+  });
+
+  testWidgets('transcript follows new output, pauses when scrolled up', (tester) async {
+    tester.view.physicalSize = const Size(1280, 700);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final daemon = FakeDaemon();
+    final client = DaemonClient(Uri.parse('ws://fake'), factory: (_) => daemon.ch = FakeChannel(daemon.handle));
+    final state = AppState(client);
+    await client.connect();
+    await tester.pumpWidget(AgentDockApp(state: state));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('attach-$sid')));
+    await tester.pumpAndSettle();
+    for (var i = 0; i < 60; i++) {
+      daemon.ch.push({'type': 'message.chunk', 'sessionId': sid, 'replay': true, 'role': 'user', 'text': '历史消息 $i'});
+    }
+    await tester.pumpAndSettle();
+    final list = tester.widget<ListView>(find.byKey(const ValueKey('transcript')));
+    final pos = list.controller!.position;
+    expect(pos.pixels, closeTo(pos.maxScrollExtent, 1), reason: 'opens at the latest output');
+    expect(find.byKey(const ValueKey('to-bottom')), findsNothing);
+
+    await tester.drag(find.byKey(const ValueKey('transcript')), const Offset(0, 600));
+    await tester.pumpAndSettle();
+    final scrolledTo = pos.pixels;
+    daemon.ch.push({'type': 'message.chunk', 'sessionId': sid, 'replay': false, 'role': 'assistant', 'text': '新输出'});
+    await tester.pumpAndSettle();
+    expect(pos.pixels, scrolledTo, reason: 'does not jump while reading history');
+    await tester.tap(find.byKey(const ValueKey('to-bottom')));
+    await tester.pumpAndSettle();
+    expect(pos.pixels, closeTo(pos.maxScrollExtent, 1));
   });
 
   testWidgets('narrow layout uses bottom navigation and shows disconnected banner', (tester) async {

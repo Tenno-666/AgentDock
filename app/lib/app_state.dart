@@ -131,6 +131,7 @@ class AppState extends ChangeNotifier {
       final c = chats.putIfAbsent('${s['sessionId']}', () => ChatSession('${s['sessionId']}', '${s['cwd']}'));
       c.promptRunning = s['promptRunning'] == true;
       c.closed = false;
+      c.originPane = s['originPane'] as String?;
     }
     for (final c in chats.values) {
       if (!ids.contains(c.sessionId)) c.closed = true;

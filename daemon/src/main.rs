@@ -93,6 +93,21 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("home: {}", e.message))?,
     );
     let scanner = tokio::spawn(scan_loop(host.clone(), todos.clone()));
+    // (b) auto hand-back: no app connected for N minutes and the session is idle
+    let handback_min: u64 = std::env::var("AGENTDOCK_HANDBACK_MINUTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let handback = (handback_min > 0).then(|| {
+        let host = host.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                host.auto_handback(Duration::from_secs(handback_min * 60))
+                    .await;
+            }
+        })
+    });
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -110,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     scanner.abort();
+    if let Some(h) = handback {
+        h.abort();
+    }
     host.shutdown_all().await;
     tracing::info!("all agent processes closed");
     Ok(())

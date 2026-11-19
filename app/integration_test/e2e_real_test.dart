@@ -55,7 +55,7 @@ void main() {
     await waitFor(t, () => !state.chats[sid]!.promptRunning, what: 'prompt.done');
     await t.pumpAndSettle();
     expect(marker.existsSync(), isTrue, reason: 'approved command really ran');
-    expect(find.textContaining('已处理：允许一次'), findsOneWidget);
+    expect(find.textContaining('审批：已允许一次'), findsOneWidget);
 
     // the todo scanner (3s) imports the confirmed marker
     await waitFor(t, () => state.todos.any((x) => x['title'] == '检查 S5 端到端标记文件' && x['sessionId'] == sid),

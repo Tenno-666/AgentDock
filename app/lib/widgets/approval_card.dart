@@ -7,6 +7,7 @@ const _optionLabels = {
   'allow_once': '允许一次',
   'allow_always': '总是允许',
   'reject_once': '拒绝',
+  'cancelled': '取消',
 };
 
 String optionLabel(String id) => _optionLabels[id] ?? id;
@@ -19,12 +20,17 @@ class ApprovalCard extends StatefulWidget {
     required this.request,
     this.resolution,
     this.showSession = false,
+    this.sheet = false,
   });
 
   final AppState state;
   final Json request;
   final String? resolution;
   final bool showSession;
+
+  /// Phone-friendly layout for the bottom sheet: big full-width buttons,
+  /// scrollable parameters.
+  final bool sheet;
 
   @override
   State<ApprovalCard> createState() => _ApprovalCardState();
@@ -68,7 +74,7 @@ class _ApprovalCardState extends State<ApprovalCard> {
     final unknown = r['inputUnknown'] == true;
     final options = List<Map<String, dynamic>>.from(r['options'] ?? const []);
     return Card(
-      key: ValueKey('approval-${r['approvalId']}'),
+      key: ValueKey('approval-${r['approvalId']}${widget.sheet ? '-sheet' : ''}'),
       color: pending ? scheme.tertiaryContainer : scheme.surfaceContainerHighest,
       margin: const EdgeInsets.symmetric(vertical: 6),
       child: Padding(
@@ -94,20 +100,36 @@ class _ApprovalCardState extends State<ApprovalCard> {
             if (unknown)
               Text('⚠ 未能获取完整参数，请谨慎批准', style: TextStyle(color: scheme.error, fontWeight: FontWeight.bold))
             else
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: scheme.surface,
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: SelectableText(
-                  prettyJson(r['rawInput']),
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+              ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: widget.sheet ? 320 : double.infinity),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: scheme.surface,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      prettyJson(r['rawInput']),
+                      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                    ),
+                  ),
                 ),
               ),
             const SizedBox(height: 8),
-            if (pending)
+            if (pending && widget.sheet)
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (final o in options)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: SizedBox(height: 52, child: _button('${o['optionId']}', '${o['kind'] ?? ''}')),
+                    ),
+                ],
+              )
+            else if (pending)
               Wrap(
                 spacing: 8,
                 children: [
@@ -136,4 +158,58 @@ class _ApprovalCardState extends State<ApprovalCard> {
     }
     return TextButton(key: key, onPressed: onPressed, child: label);
   }
+}
+
+/// Bottom sheet for answering one approval; closes itself once it is resolved
+/// (here or on another device).
+class ApprovalSheet extends StatefulWidget {
+  const ApprovalSheet({super.key, required this.state, required this.request});
+  final AppState state;
+  final Json request;
+
+  @override
+  State<ApprovalSheet> createState() => _ApprovalSheetState();
+}
+
+class _ApprovalSheetState extends State<ApprovalSheet> {
+  bool _closing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.state.addListener(_check);
+  }
+
+  @override
+  void dispose() {
+    widget.state.removeListener(_check);
+    super.dispose();
+  }
+
+  void _check() {
+    if (_closing || widget.state.approvals.containsKey('${widget.request['approvalId']}')) return;
+    _closing = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && ModalRoute.of(context)?.isCurrent == true) Navigator.of(context).pop();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        child: ApprovalCard(state: widget.state, request: widget.request, sheet: true),
+      ),
+    );
+  }
+}
+
+Future<void> showApprovalSheet(BuildContext context, AppState state, Json request) {
+  return showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    builder: (_) => ApprovalSheet(state: state, request: request),
+  );
 }

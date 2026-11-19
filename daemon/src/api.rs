@@ -177,6 +177,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
     let mut events = state.host.subscribe();
+    state.host.client_connected();
 
     let writer = tokio::spawn(async move {
         loop {
@@ -218,6 +219,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         });
     }
     writer.abort();
+    state.host.client_disconnected();
 }
 
 pub async fn handle_text(state: &AppState, text: &str) -> Value {

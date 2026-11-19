@@ -324,3 +324,50 @@ async fn agent_crash_releases_slot() {
     assert_eq!(evs.last().unwrap()["reason"], "agent_exited");
     assert!(env.host.attached_list().is_empty());
 }
+
+#[tokio::test]
+async fn auto_handback_when_no_client_and_idle() {
+    use agentdock_daemon::discovery::PaneRef;
+    let mut env = setup("autohb", 4);
+    env.host.attach(OK_ID).await.unwrap();
+    assert_eq!(env.host.attached_list()[0]["originPane"], Value::Null);
+    let pane = PaneRef {
+        socket: "/nonexistent/tmux".into(),
+        target: "x:1.1".into(),
+        label: "x:1.1".into(),
+    };
+    env.host.set_origin_pane(OK_ID, Some(pane));
+    assert_eq!(env.host.attached_list()[0]["originPane"], "x:1.1");
+
+    env.host.client_connected();
+    assert!(
+        env.host.auto_handback(Duration::ZERO).await.is_empty(),
+        "a client is connected"
+    );
+    env.host.client_disconnected();
+
+    env.host.prompt(OK_ID, "slow please").await.unwrap();
+    assert!(
+        env.host.auto_handback(Duration::ZERO).await.is_empty(),
+        "turn running"
+    );
+    env.host.cancel(OK_ID).await.unwrap();
+    collect_until(&mut env.events, |e| e["type"] == "prompt.done").await;
+    assert!(
+        env.host
+            .auto_handback(Duration::from_secs(3600))
+            .await
+            .is_empty(),
+        "not idle long enough"
+    );
+
+    let r = env.host.auto_handback(Duration::ZERO).await;
+    assert_eq!(r.len(), 1);
+    assert!(
+        r[0]["handbackError"].is_string(),
+        "fake pane cannot be typed into: {r:?}"
+    );
+    let evs = collect_until(&mut env.events, |e| e["type"] == "session.closed").await;
+    assert_eq!(evs.last().unwrap()["reason"], "auto_handback");
+    assert!(env.host.attached_list().is_empty());
+}

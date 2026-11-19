@@ -138,6 +138,8 @@ pub struct Host {
     op_lock: tokio::sync::Mutex<()>,
     audit_lock: Mutex<()>,
     events: broadcast::Sender<Value>,
+    /// (connected clients, when the last one left)
+    presence: Mutex<(usize, Option<std::time::Instant>)>,
 }
 
 fn now_ms() -> u64 {
@@ -158,6 +160,7 @@ impl Host {
             op_lock: tokio::sync::Mutex::new(()),
             audit_lock: Mutex::new(()),
             events,
+            presence: Mutex::new((0, None)),
         })
     }
 
@@ -191,6 +194,7 @@ impl Host {
                     "cwd": a.cwd,
                     "pid": a.client.pid(),
                     "promptRunning": a.prompt_running.load(Ordering::SeqCst),
+                    "originPane": a.origin_pane.lock().unwrap().as_ref().map(|p| p.label.clone()),
                 })
             })
             .collect();
@@ -616,6 +620,15 @@ impl Host {
 
     /// `handback`: after closing, resume the session in the pane it was taken from.
     pub async fn detach_opts(&self, session_id: &str, handback: bool) -> Result<Value, HostError> {
+        self.detach_inner(session_id, handback, "detached").await
+    }
+
+    async fn detach_inner(
+        &self,
+        session_id: &str,
+        handback: bool,
+        reason: &str,
+    ) -> Result<Value, HostError> {
         let att = self
             .sessions
             .lock()
@@ -624,7 +637,7 @@ impl Host {
             .ok_or_else(not_attached)?;
         close(&att).await;
         self.drop_approvals(session_id, "detached");
-        self.emit(json!({"type": "session.closed", "sessionId": session_id, "reason": "detached"}));
+        self.emit(json!({"type": "session.closed", "sessionId": session_id, "reason": reason}));
         let origin = att.origin_pane.lock().unwrap().clone();
         let mut out = json!({"sessionId": session_id, "detached": true, "handedBack": false});
         if !handback {
@@ -649,6 +662,72 @@ impl Host {
             Err(e) => out["handbackError"] = json!(e),
         }
         Ok(out)
+    }
+
+    pub fn client_connected(&self) {
+        let mut p = self.presence.lock().unwrap();
+        p.0 += 1;
+        p.1 = None;
+    }
+
+    pub fn client_disconnected(&self) {
+        let mut p = self.presence.lock().unwrap();
+        p.0 = p.0.saturating_sub(1);
+        if p.0 == 0 {
+            p.1 = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Record / override the terminal pane a session came from (also used by tests).
+    pub fn set_origin_pane(&self, session_id: &str, pane: Option<discovery::PaneRef>) {
+        if let Some(a) = self.get(session_id) {
+            *a.origin_pane.lock().unwrap() = pane;
+        }
+    }
+
+    /// When no client has been connected for `idle`, hand idle sessions that were
+    /// taken over from a terminal back to their pane. Returns the detach replies.
+    pub async fn auto_handback(&self, idle: Duration) -> Vec<Value> {
+        let since = {
+            let p = self.presence.lock().unwrap();
+            match *p {
+                (0, Some(t)) => t,
+                _ => return Vec::new(),
+            }
+        };
+        if since.elapsed() < idle {
+            return Vec::new();
+        }
+        let pending: std::collections::HashSet<String> = self
+            .approvals
+            .lock()
+            .unwrap()
+            .values()
+            .map(|a| a.session_id.clone())
+            .collect();
+        let due: Vec<String> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, a)| {
+                a.origin_pane.lock().unwrap().is_some()
+                    && !a.prompt_running.load(Ordering::SeqCst)
+                    && !pending.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut out = Vec::new();
+        for sid in due {
+            match self.detach_inner(&sid, true, "auto_handback").await {
+                Ok(v) => {
+                    tracing::info!(session_id = %sid, "auto handback: {v}");
+                    out.push(v);
+                }
+                Err(e) => tracing::warn!(session_id = %sid, "auto handback failed: {}", e.message),
+            }
+        }
+        out
     }
 
     /// Working directories of attached sessions (rename protection).
