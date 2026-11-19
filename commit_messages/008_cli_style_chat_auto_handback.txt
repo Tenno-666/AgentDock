@@ -1,0 +1,46 @@
+[Feature] Kiro CLI style transcript, approval bottom sheet, auto hand-back
+
+[Root Cause]
+1. After reopening the app, detach no longer offered hand-back: the origin
+   pane was only returned by session.attach and lost on app restart.
+2. Closing the app left taken-over sessions attached forever.
+3. The bubble chat view started at the top of the history and hid tool
+   details; it should read like the Kiro CLI, with a phone-friendly
+   approval UI.
+
+[Solution]
+1. attached.list returns originPane; the app restores it on resync.
+2. Auto hand-back: the host counts WebSocket clients; when none has been
+   connected for AGENTDOCK_HANDBACK_MINUTES (default 10, 0 disables) a
+   30 s loop detaches idle sessions (no running turn, no pending
+   approval) that came from a tmux pane and resumes them there.
+   session.closed carries reason "auto_handback".
+3. Chat view: dark monospace transcript like the Kiro CLI. "> prompt"
+   rows separated per turn, replies rendered as Markdown
+   (flutter_markdown_plus, selectable), thoughts shown by default,
+   "● Shell <command>" tool rows with live output (last 12 lines, tap to
+   expand), status line (思考中 / 回复中 / 执行工具中 / 等待审批 / 空闲).
+   Follows new output, pauses when the user scrolls up, "back to bottom"
+   button; opens at the latest output.
+4. Approvals open as a bottom sheet with large full-width buttons and a
+   scrollable parameter box; it closes itself once answered anywhere, is
+   not re-opened after being dismissed, and the transcript keeps a one
+   line record that reopens it.
+
+[Test]
+测试路径：daemon/、app/
+测试步骤：
+    1. cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+    2. flutter analyze && flutter test
+    3. flutter test integration_test/e2e_real_test.dart -d linux
+       flutter test integration_test/e2e_takeover_test.dart -d linux
+    4. AGENTDOCK_HANDBACK_MINUTES=1 启动 daemon，dockctl attach <id> --takeover 后不连接任何客户端
+预期结果：
+    1. 38 个测试通过（单元 29 + 集成 9），无告警
+    2. 6 个 widget 测试通过（含审批面板、自动滚动）
+    3. 两个真实端到端测试通过
+    4. 约 75 秒后原 tmux 窗格重新运行 kiro-cli，日志出现 auto handback
+
+[API Changes]
+attached.list 新增 originPane；session.closed 新增 reason auto_handback
+新增环境变量 AGENTDOCK_HANDBACK_MINUTES

@@ -1,0 +1,55 @@
+[Feature] One-click takeover/hand-back, folder picker, kiro-cli path fix
+
+[Root Cause]
+1. Attach failed with "spawn kiro-cli: No such file or directory" when the
+   daemon was not started from an interactive shell: its PATH lacks
+   ~/.local/bin where kiro-cli is installed.
+2. Takeover required quitting the session in the terminal first, but a
+   quit session is no longer active and disappeared from the list.
+3. New sessions needed a typed path; sessions live in folders on the
+   computer, so the app (also on phone later) needs to browse them.
+4. Found while testing: under a non-UTF-8 locale tmux replaces the tab
+   separator in -F output with "_", so no pane was recognized.
+
+[Solution]
+1. resolve_kiro_cli: $AGENTDOCK_KIRO_CLI, then PATH, then
+   ~/.local/bin/kiro-cli; logged at startup; spawn error explains the fix.
+2. session.attach takeover=true: find the session's tmux pane via its
+   lock pid, require the pane foreground to be kiro-cli and the session
+   idle (last JSONL record is a final reply; otherwise TERMINAL_BUSY),
+   send C-u + /quit, wait for the lock to release, load. If loading then
+   fails, resume it back in the pane.
+   session.detach handback=true: resume in the original pane with
+   cd '<cwd>' && kiro-cli --resume-id <id>, only if the pane is at a shell.
+   sessions.recent: sessions that are neither running nor attached.
+3. fs.list / fs.mkdir / fs.rename confined to HOME (canonicalized, no
+   symlink escape, no delete). Rename is blocked while a live/attached
+   session is inside and needs force=true when historical sessions are.
+4. tmux called with LC_ALL=C.UTF-8 and a space separator.
+5. App: takeover confirmation dialog, hand-back checkbox (default on when
+   taken over from a pane), recent sessions section, folder picker page
+   (breadcrumb, hidden toggle, new folder, rename with confirmation,
+   create session here). FAB heroTag fix for IndexedStack.
+
+[Test]
+测试路径：daemon/、app/
+测试步骤：
+    1. cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+    2. flutter analyze && flutter test
+    3. env -i HOME=$HOME PATH=/usr/bin:/bin ./target/release/agentdock-daemon
+    4. flutter test integration_test/e2e_takeover_test.dart -d linux
+    5. 隔离 tmux 中让会话停在 y/n 审批时执行 dockctl attach <id> --takeover
+    6. flutter test integration_test/e2e_real_test.dart -d linux
+预期结果：
+    1. 37 个测试通过（单元 29 + 集成 8），无告警
+    2. 5 个 widget 测试通过
+    3. 日志显示 kiro-cli: /home/mi/.local/bin/kiro-cli，会话列表能识别 tmux 窗格
+    4. App 一键接管 → 回复 E2E-TAKEOVER → 断开交还后窗格重新运行 kiro-cli；
+       文件夹选择器新建、重命名目录并在其中新建会话
+    5. 返回 TERMINAL_BUSY，终端审批菜单不受影响；草稿不会被发送
+    6. 原审批与待办端到端流程保持通过
+
+[API Changes]
+session.attach 新增 takeover；session.detach 新增 handback（返回 handedBack / pane / handbackError）
+新增请求：sessions.recent、fs.list、fs.mkdir、fs.rename
+新增错误码：TERMINAL_BUSY、TAKEOVER_FAILED、RENAME_BLOCKED、CONFIRM_REQUIRED、EXISTS、FORBIDDEN

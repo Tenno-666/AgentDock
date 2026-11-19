@@ -1,0 +1,46 @@
+[Feature] S5 Flutter Linux app
+
+[Root Cause]
+Phase 1 needs a GUI on top of the daemon: list sessions, take one over,
+chat, answer approvals and manage todos, with a layout that will also
+work on Android in phase 2.
+
+[Solution]
+1. daemon_client.dart: one WebSocket connection, request/reply matching by
+   id, events as a broadcast stream, reconnect with backoff (0.5s..10s),
+   resync (sessions / attached / approvals / todos) after every connect.
+2. app_state.dart: ChangeNotifier model built from events; streamed chunks
+   are merged per role; tool.call updates merged by toolCallId; approvals
+   tracked by approvalId and marked resolved from permission.resolved.
+3. Pages:
+   - 会话: active sessions with tmux pane / attached status, read-only
+     history view, attach, new session dialog.
+   - 对话: up to 4 tabs (red dot = pending approval, spinner = running),
+     replayed history, tool call cards with full rawInput / output,
+     inline approval cards, multi-line composer (Ctrl+Enter sends),
+     cancel, detach with terminal resume hint.
+   - 审批: all pending approvals across sessions.
+   - 待办: open / done / all, add with priority and due date, check off,
+     delete, jump to source session.
+   ApprovalCard shows the exact rawInput, warns on inputUnknown, and asks
+   a second confirmation for allow_always.
+   Wide (>=720px) uses NavigationRail, narrow uses NavigationBar.
+4. Tests: widget tests with an in-memory fake daemon channel; a real
+   end-to-end integration test (Linux desktop + daemon + kiro-cli).
+5. Linux window title AgentDock; README run instructions.
+
+[Test]
+测试路径：app/
+测试步骤：
+    1. flutter analyze && flutter test
+    2. 启动 daemon 后 flutter test integration_test/e2e_real_test.dart -d linux
+    3. flutter build linux --release，运行 bundle/agentdock_app
+预期结果：
+    1. 无告警，3 个 widget 测试通过（接管→对话→审批→待办全流程、
+       总是允许二次确认、窄屏底栏与断线提示）
+    2. 新建会话 → 审批卡片显示 touch 命令且批准前文件不存在 →
+       点"允许一次"后文件被创建 → 【待办已确认】自动出现在待办页
+    3. 会话页列出的会话与 tmux 中运行的 Kiro 窗格一致
+
+[API Changes]
+无对外 API 变更（新增客户端）

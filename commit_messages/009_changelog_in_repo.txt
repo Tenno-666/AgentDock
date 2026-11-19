@@ -1,0 +1,24 @@
+[Task] Track commit messages in the repo as the changelog
+
+[Root Cause]
+Commit message files lived outside the repository and were not versioned;
+they already describe every change in detail (background, solution, test
+steps, API changes) and can serve as the project changelog.
+
+[Solution]
+1. Move commit_messages/ into the repository and track all files
+   (001-008 from earlier commits, this 009).
+2. README: add a 更新日志 section and list the folder in the layout.
+3. From now on each commit includes its own NNN_*.txt file.
+
+[Test]
+测试路径：commit_messages/、README.md
+测试步骤：
+    1. grep -rnE "github_pat_|ghp_|password" commit_messages
+    2. 对照 git log 与 commit_messages 序号
+预期结果：
+    1. 无输出
+    2. 001-009 与提交一一对应
+
+[API Changes]
+无对外 API 变更

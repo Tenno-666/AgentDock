@@ -1,0 +1,45 @@
+[Feature] S4 todo collection from session markers
+
+[Root Cause]
+Things agreed with the AI ("do this later") get forgotten. The steering now
+asks the AI to emit a two-step marker (candidate, then confirmed after the
+user agrees); the daemon must turn confirmed markers into a todo list.
+
+[Solution]
+1. todo module:
+   - extract_confirmed: lines in AI replies starting with 【待办已确认】
+     (<=3 leading spaces), ignoring fenced/indented code, inline mentions
+     and user prompts; candidates are not stored.
+   - SQLite store ~/.local/share/agentdock/agentdock.sqlite3 (mode 0600,
+     bundled rusqlite). Columns priority / due_date reserved for the
+     extended marker format.
+   - Dedup key agent|session|message|title; delete is a soft delete so a
+     rescan never brings a deleted todo back.
+   - Incremental scan of ~/.kiro/sessions/cli/*.jsonl by persisted byte
+     offset, only complete lines, reset on shrink; byte prefilter before
+     JSON parsing (653 MB initial scan ~8-10 s in debug build).
+2. main: scan every 3 s, emit todo.changed for new todos; AGENTDOCK_DB
+   overrides the database path.
+3. api: AppState { host, todos }; todo.list / add / update / delete
+   (null clears priority / dueDate), todo.changed events.
+4. dockctl: todo [open|done|all|add|done|reopen|rm|watch].
+
+[Test]
+测试路径：daemon/
+测试步骤：
+    1. cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+    2. 启动 daemon，dockctl todo watch；dockctl new <spike/workdir>
+    3. send "加暗色主题，暂时先不做但要记着" → send "确认，加入待办"
+    4. send 另一个"先记着" → send "算了，不用加入待办"
+    5. todo add / done；重启 daemon；todo rm；清空 scan_offsets 后重启
+预期结果：
+    1. 30 个测试通过（单元 22 + 集成 8），无告警
+    2. 首次全量扫描完成，历史会话 0 条误收
+    3. 第一轮只出现【待办候选】且不入库；确认后约 2s 内 watch 收到 added
+    4. 不入库
+    5. 重启后无重复；删除的自动待办在全量重扫后不复活
+
+[API Changes]
+新增请求：todo.list、todo.add、todo.update、todo.delete
+新增事件：todo.changed
+api::router 参数改为 AppState

@@ -65,12 +65,17 @@ cd daemon && ./target/release/dockctl sessions
 
 测试：`cd daemon && cargo test`；`cd app && flutter test`；真实端到端（需 daemon 在运行，会消耗模型调用）：`cd app && flutter test integration_test/e2e_real_test.dart -d linux`。
 
+## 更新日志
+
+每次提交的完整说明（背景、方案、测试步骤与预期、接口变更）按序号存放在 [commit_messages/](commit_messages/)，与 git 提交一一对应。
+
 ## 目录结构
 
 ```
 daemon/   Rust 常驻服务
 app/      Flutter App
 docs/     设计文档与实测记录
+commit_messages/  更新日志（每次提交的说明，按序号）
 spike/    前期验证脚本（acp_probe.py）
 ```
 

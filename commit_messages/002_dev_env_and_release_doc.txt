@@ -1,0 +1,24 @@
+[Task] Add development environment and release guide
+
+[Root Cause]
+Push authentication (GitHub fine-grained PAT) and repo-level commit email
+setup were figured out during the first push but not written down; the
+token expires and the steps are easy to forget.
+
+[Solution]
+Add docs/开发环境与发布.md: verified tool versions, build and check
+commands, repo-level user.email and --amend --reset-author fix, PAT
+generation steps (including the Add permissions search pitfall) and the
+SSH key alternative. No credentials included.
+
+[Test]
+测试路径：docs/开发环境与发布.md
+测试步骤：
+    1. grep -rnE "github_pat_|ghp_" docs README.md
+    2. 按 4.1 节步骤在 GitHub 页面走一遍
+预期结果：
+    1. 无输出
+    2. 每一步都能在页面上找到对应入口
+
+[API Changes]
+无对外 API 变更

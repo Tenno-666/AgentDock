@@ -1,0 +1,39 @@
+[Feature] S0 ACP verification and S1 daemon skeleton
+
+[Root Cause]
+AgentDock needs to discover local Kiro CLI sessions and expose them to
+phone/desktop apps. Before building, the ACP (Agent Client Protocol)
+capabilities had to be verified on kiro-cli 2.13.0: remote permission
+approval, session history loading, concurrent access, takeover and hand-back.
+
+[Solution]
+1. spike/acp_probe.py: stdlib-only ACP client used for S0 tests T1-T5,
+   with a guard that only loads sessions created under spike/workdir.
+   Results in docs/S0-实测记录.md.
+2. daemon (Rust, tokio + axum):
+   - discovery: active sessions from ~/.kiro/sessions/cli/*.lock, skip stale
+     locks (dead pid or pid reused by a non kiro-cli-chat process), map to
+     tmux pane by walking the parent process chain.
+   - session_log: tolerant parser for session JSONL (Prompt /
+     AssistantMessage / ToolResults / Compaction; unknown kinds kept as Other).
+   - api: WebSocket /ws with sessions.list and session.view; session ids
+     validated to block path traversal.
+   - main: listens on 127.0.0.1:7820 only, refuses non-loopback addresses.
+   - bin/dockctl: CLI client for acceptance testing.
+3. README and .gitignore (spike logs with conversation content excluded).
+
+[Test]
+测试路径：daemon/
+测试步骤：
+    1. cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+    2. cargo run --bin agentdock-daemon，另开终端执行 cargo run --bin dockctl -- sessions
+    3. cargo run --bin dockctl -- view <测试会话ID>
+    4. AGENTDOCK_ADDR=0.0.0.0:7821 cargo run --bin agentdock-daemon
+预期结果：
+    1. 12 个单元测试通过，clippy 与 fmt 无告警
+    2. 列出的会话与 tmux 中运行 kiro-cli 的窗格一一对应，残留锁不出现
+    3. 输出的对话条数与内容和会话 JSONL 文件一致
+    4. 启动失败并提示 refusing to listen on non-loopback address
+
+[API Changes]
+新增 WebSocket 接口：sessions.list、session.view

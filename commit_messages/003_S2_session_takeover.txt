@@ -1,0 +1,55 @@
+[Feature] S2 session takeover and chat over ACP
+
+[Root Cause]
+S1 could only list and read sessions. To continue a conversation from the
+app, the daemon has to drive kiro-cli itself: load an existing session,
+send prompts, stream replies and release the session back to the terminal.
+
+[Solution]
+1. acp/client: minimal JSON-RPC-over-stdio ACP client. Every frame,
+   responses included, goes through one ordered channel so history replay
+   is handled before the session/load response returns. start_request /
+   finish_request split guarantees session/cancel is written after the
+   prompt it cancels.
+2. acp_host: manages up to 4 kiro-cli acp processes.
+   - attach (session/load, replay events flagged replay=true, retry once
+     on timeout), new (cwd must be under HOME), prompt (one turn at a
+     time), cancel, detach, shutdown_all.
+   - Error codes: SESSION_BUSY (kiro session lock, with tmux pane hint),
+     LIMIT_REACHED, PROMPT_RUNNING, LOAD_TIMEOUT, NOT_ATTACHED, NOT_FOUND.
+   - S2 policy: every session/request_permission is auto-rejected.
+   - Agent crash removes the slot and emits session.closed.
+3. api: long-lived WebSocket; events (message.chunk, tool.call,
+   permission.autoRejected, prompt.started/done, session.attached/closed)
+   broadcast to all clients; biased select delivers events before replies.
+4. discovery: tmux pane lookup scans every tmux server of the user.
+5. main: graceful shutdown on SIGINT/SIGTERM closes all agent processes.
+6. dockctl: attached / attach / new / send / chat / cancel / detach.
+7. tests/fake_agent.py + host integration tests (no model calls).
+
+[Test]
+测试路径：daemon/
+测试步骤：
+    1. cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+    2. 启动 daemon；dockctl attach <已退出终端的会话> → dockctl send <id> "请只回复：S2-OK"
+    3. dockctl send 让 AI 执行 touch <标记文件>
+    4. 会话开在 tmux 中时 dockctl attach <id>
+    5. 连续 dockctl new <HOME 下目录> 5 次；dockctl new /etc
+    6. dockctl detach <id> 后终端执行 kiro-cli --resume-id <id>
+    7. kill -TERM <daemon pid>
+预期结果：
+    1. 23 个测试通过（单元 17 + 集成 6），无告警
+    2. 回放历史后流式输出 S2-OK，stopReason=end_turn
+    3. 出现"已自动拒绝"，工具状态 failed，标记文件不存在
+    4. SESSION_BUSY，提示 tmux 窗口名
+    5. 第 5 次 LIMIT_REACHED；/etc 返回 BAD_REQUEST
+    6. 终端里能看到 daemon 期间的对话
+    7. daemon 退出，其启动的 kiro-cli acp 进程全部退出
+
+[API Changes]
+新增 WebSocket 请求：attached.list、session.attach、session.new、
+prompt.send、prompt.cancel、session.detach
+新增推送事件：message.chunk、tool.call、permission.autoRejected、
+prompt.started、prompt.done、session.attached、session.closed、
+session.update、events.lagged
+错误回复新增 code 字段

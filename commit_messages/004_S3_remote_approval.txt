@@ -1,0 +1,51 @@
+[Feature] S3 remote permission approval with audit log
+
+[Root Cause]
+S2 auto-rejected every tool call, so an attached session could not do real
+work. Approvals must be answered from the app, the card must show exactly
+what will run, and every decision must be traceable.
+
+[Solution]
+1. acp_host: session/request_permission becomes a pending approval
+   (approvalId ap-N) broadcast as permission.request.
+   - Parameters: the request only carries a title (S0 T1), so rawInput,
+     kind and toolName are taken from the preceding tool_call update with
+     the same toolCallId; inputUnknown=true flags a card without them.
+   - permission.reply: optionId must be one the agent offered; first reply
+     wins, later replies get APPROVAL_NOT_FOUND.
+   - No automatic approval: an unanswered request keeps the agent waiting.
+   - prompt.cancel answers pending approvals with outcome "cancelled" (ACP
+     rule); detach / agent exit / shutdown void them. All emit
+     permission.resolved with a reason.
+   - Audit log ~/.local/share/agentdock/audit.jsonl (mode 0600): one
+     "requested" and one "resolved" line per approval.
+2. api: permission.list (pending cards for late-joining clients),
+   permission.reply.
+3. dockctl: approval card with full parameters; y/a/n answer on stdin,
+   empty line keeps waiting; approvals / approve commands to answer from
+   another terminal.
+4. Tests: allow / reject / wait+cancel+detach flows and audit content on
+   the fake agent; audit file permission unit test.
+
+[Test]
+测试路径：daemon/
+测试步骤：
+    1. cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+    2. dockctl new <spike/workdir>；dockctl send <id> "执行 touch <文件A>"，卡片出现后输入 y
+    3. 同上换文件 B，输入 n
+    4. 同上换文件 C，直接回车；20 秒后另开终端 dockctl approvals、
+       dockctl approve <ap-id> allow_once，再执行一次 approve <ap-id> reject_once
+    5. 查看 ~/.local/share/agentdock/audit.jsonl
+预期结果：
+    1. 25 个测试通过（单元 17 + 集成 8），无告警
+    2. 卡片 command 与实际执行一致，文件 A 被创建
+    3. 工具状态 failed，文件 B 不存在
+    4. 20 秒内仍为 1 个待审批、文件 C 不存在；approve 后文件 C 被创建；
+       第二次 approve 返回 APPROVAL_NOT_FOUND
+    5. 权限 600，每个审批各有 requested / resolved 两行
+
+[API Changes]
+新增请求：permission.list、permission.reply
+新增事件：permission.request、permission.resolved
+移除事件：permission.autoRejected
+HostConfig 新增 audit_path
